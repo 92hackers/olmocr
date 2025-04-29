@@ -213,6 +213,7 @@ async def apost(url, json_data):
                 pass
 
 
+# Actually requesting the page content to the SGLang server model api, to extract the anchor text and the page content
 async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path: str, page_num: int) -> PageResult:
     COMPLETION_URL = f"http://localhost:{SGLANG_SERVER_PORT}/v1/chat/completions"
     MAX_RETRIES = args.max_page_retries
@@ -668,112 +669,6 @@ async def metrics_reporter(work_queue):
         await asyncio.sleep(10)
 
 
-def submit_beaker_job(args):
-    from beaker import (  # type: ignore
-        Beaker,
-        Constraints,
-        EnvVar,
-        ExperimentSpec,
-        ImageSource,
-        Priority,
-        ResultSpec,
-        SecretNotFound,
-        TaskContext,
-        TaskResources,
-        TaskSpec,
-    )
-
-    b = Beaker.from_env(default_workspace=args.beaker_workspace)
-    account = b.account.whoami()
-    owner = account.name
-    beaker_image = f"jakep/olmocr-inference-{VERSION}"
-
-    task_name = f"olmocr-{os.path.basename(args.workspace.rstrip('/'))}"
-
-    # Take out --beaker flag so the workers will just run things
-    args_list = [arg for arg in sys.argv[1:] if arg != "--beaker"]
-
-    # Take out the --pdfs [arg] or --pdfs=[arg], since the queue is populated locally
-    args_list = [arg for i, arg in enumerate(args_list) if not (arg.startswith("--pdfs") or (i > 0 and args_list[i - 1] == "--pdfs"))]
-
-    try:
-        b.secret.get(f"{owner}-WEKA_ACCESS_KEY_ID", args.beaker_workspace)
-        b.secret.get(f"{owner}-WEKA_SECRET_ACCESS_KEY", args.beaker_workspace)
-        b.secret.get(f"{owner}-AWS_CREDENTIALS_FILE", args.beaker_workspace)
-    except SecretNotFound:
-        print(
-            f"Expected beaker secrets for accessing Weka and S3 are not found. Are you okay to write those to your beaker workspace {args.beaker_workspace}? [y/n]"
-        )
-
-        if input().strip().lower() != "y":
-            print("Exiting...")
-            sys.exit(1)
-
-        b.secret.write(f"{owner}-WEKA_ACCESS_KEY_ID", os.environ.get("WEKA_ACCESS_KEY_ID", ""), args.beaker_workspace)
-        b.secret.write(f"{owner}-WEKA_SECRET_ACCESS_KEY", os.environ.get("WEKA_SECRET_ACCESS_KEY", ""), args.beaker_workspace)
-        b.secret.write(
-            f"{owner}-AWS_CREDENTIALS_FILE",
-            open(os.path.join(os.path.expanduser("~"), ".aws", "credentials")).read(),
-            args.beaker_workspace,
-        )
-
-    env_var_secrets = [
-        EnvVar(name="WEKA_ACCESS_KEY_ID", secret=f"{owner}-WEKA_ACCESS_KEY_ID"),
-        EnvVar(name="WEKA_SECRET_ACCESS_KEY", secret=f"{owner}-WEKA_SECRET_ACCESS_KEY"),
-        EnvVar(name="AWS_CREDENTIALS_FILE", secret=f"{owner}-AWS_CREDENTIALS_FILE"),
-    ]
-
-    try:
-        b.secret.get("OLMOCR_PREVIEW_HF_TOKEN", args.beaker_workspace)
-        env_var_secrets.append(EnvVar(name="HF_TOKEN", secret="OLMOCR_PREVIEW_HF_TOKEN"))
-    except SecretNotFound:
-        pass
-
-    try:
-        b.secret.get("OE_DATA_GCS_SA_KEY", args.beaker_workspace)
-        env_var_secrets.append(EnvVar(name="GOOGLE_APPLICATION_CREDENTIALS_FILE", secret="OE_DATA_GCS_SA_KEY"))
-    except SecretNotFound:
-        print("Input the olmo-gcs SA key if you would like to load weights from gcs (end with a double newline):")
-        lines = []
-        prev_empty = False
-        for line in iter(input, None):
-            if not line and prev_empty:
-                break
-            prev_empty = not line
-            lines.append(line)
-        gcs_sa_key = "\n".join(lines[:-1]).strip()  # Remove the last empty line
-        if gcs_sa_key:
-            b.secret.write("OE_DATA_GCS_SA_KEY", gcs_sa_key, args.beaker_workspace)
-            env_var_secrets.append(EnvVar(name="GOOGLE_APPLICATION_CREDENTIALS_FILE", secret="OE_DATA_GCS_SA_KEY"))
-
-    # Create the experiment spec
-    experiment_spec = ExperimentSpec(
-        budget="ai2/oe-data",
-        description=task_name,
-        tasks=[
-            TaskSpec(
-                name=task_name,
-                propagate_failure=False,
-                propagate_preemption=False,
-                replicas=args.beaker_gpus,
-                context=TaskContext(
-                    priority=Priority(args.beaker_priority),
-                    preemptible=True,
-                ),
-                image=ImageSource(beaker=beaker_image),
-                command=["python", "-m", "olmocr.pipeline"] + args_list,
-                env_vars=[EnvVar(name="BEAKER_JOB_NAME", value=task_name), EnvVar(name="OWNER", value=owner)] + env_var_secrets,
-                resources=TaskResources(gpu_count=1),
-                constraints=Constraints(cluster=args.beaker_cluster if isinstance(args.beaker_cluster, list) else [args.beaker_cluster]),
-                result=ResultSpec(path="/noop-results"),
-            )
-        ],
-    )
-
-    experiment_data = b.experiment.create(spec=experiment_spec, workspace=args.beaker_workspace)
-
-    print(f"Experiment URL: https://beaker.org/ex/{experiment_data.id}")
-
 
 def print_stats(args):
     LONG_CONTEXT_THRESHOLD = 32768
@@ -928,16 +823,6 @@ async def main():
     parser.add_argument("--target_longest_image_dim", type=int, help="Dimension on longest side to use for rendering the pdf pages", default=1024)
     parser.add_argument("--target_anchor_text_len", type=int, help="Maximum amount of anchor text to use (characters)", default=6000)
 
-    # Beaker/job running stuff
-    parser.add_argument("--beaker", action="store_true", help="Submit this job to beaker instead of running locally")
-    parser.add_argument("--beaker_workspace", help="Beaker workspace to submit to", default="ai2/olmocr")
-    parser.add_argument(
-        "--beaker_cluster",
-        help="Beaker clusters you want to run on",
-        default=["ai2/jupiter-cirrascale-2", "ai2/ceres-cirrascale", "ai2/neptune-cirrascale", "ai2/saturn-cirrascale", "ai2/augusta-google-1"],
-    )
-    parser.add_argument("--beaker_gpus", type=int, default=1, help="Number of gpu replicas to run")
-    parser.add_argument("--beaker_priority", type=str, default="normal", help="Beaker priority level for the job")
     parser.add_argument("--port", type=int, default=30024, help="Port to use for the SGLang server")
     args = parser.parse_args()
 
@@ -945,28 +830,6 @@ async def main():
     # set the global SGLANG_SERVER_PORT from args
     global SGLANG_SERVER_PORT
     SGLANG_SERVER_PORT = args.port
-
-    # setup the job to work in beaker environment, load secrets, adjust logging, etc.
-    if "BEAKER_JOB_NAME" in os.environ:
-        sglang_logger.addHandler(console_handler)
-        cred_path = os.path.join(os.path.expanduser("~"), ".aws", "credentials")
-        os.makedirs(os.path.dirname(cred_path), exist_ok=True)
-        with open(cred_path, "w") as f:
-            f.write(os.environ.get("AWS_CREDENTIALS_FILE"))
-        cred_path = os.path.join(os.path.expanduser("~"), ".gcs", "credentials")
-        os.makedirs(os.path.dirname(cred_path), exist_ok=True)
-        with open(cred_path, "w") as f:
-            f.write(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_FILE"))
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = cred_path
-        workspace_s3 = boto3.client("s3")
-        pdf_s3 = boto3.client("s3")
-
-        # Wait a little bit so that not all beaker jobs in a task start at the same time and download the model at the same time
-        replica_count = int(os.environ.get("BEAKER_REPLICA_COUNT", "1"))
-        interval = 10 if (replica_count - 1) * 10 <= 240 else 240 / max(1, replica_count - 1)
-        sleep_time = int(int(os.environ.get("BEAKER_REPLICA_RANK", "0")) * interval)
-        logger.info(f"Beaker job sleeping for {sleep_time} seconds to stagger model downloads")
-        await asyncio.sleep(sleep_time)
 
     if args.workspace_profile:
         workspace_session = boto3.Session(profile_name=args.workspace_profile)
@@ -1053,10 +916,6 @@ async def main():
 
     if args.stats:
         print_stats(args)
-        return
-
-    if args.beaker:
-        submit_beaker_job(args)
         return
 
     # If you get this far, then you are doing inference and need a GPU
