@@ -288,12 +288,22 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
             await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "cancelled")
             raise
         except json.JSONDecodeError as e:
+            # Debugging, view raw response
+            print(f"----------------------------------------------------------------------------")
+            print(f"Raw response: {response_body}")
+            print(f"----------------------------------------------------------------------------")
             logger.warning(f"JSON decode error on attempt {attempt} for {pdf_orig_path}-{page_num}: {e}")
             attempt += 1
         except ValueError as e:
+            print(f"----------------------------------------------------------------------------")
+            print(f"Raw response: {response_body}")
+            print(f"----------------------------------------------------------------------------")
             logger.warning(f"ValueError on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
             attempt += 1
         except Exception as e:
+            print(f"----------------------------------------------------------------------------")
+            print(f"Raw response: {response_body}")
+            print(f"----------------------------------------------------------------------------")
             logger.exception(f"Unexpected error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
             attempt += 1
 
