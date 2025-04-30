@@ -1,5 +1,9 @@
 #! /usr/bin/env bash
 
+# ref: https://github.com/allenai/olmocr/tree/main?tab=readme-ov-file#multi-node--cluster-usage
+# olmocr, maintains a working queue of jobs to process, and a worker pool to process them.
+# So, you can run this script on a single machine, or across a cluster, to process millions of pages simultaneously.
+
 set -ex
 
 # Make sure the dependencies are correctly installed
