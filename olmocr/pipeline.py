@@ -106,6 +106,10 @@ class PageResult:
 
 
 async def build_page_query(local_pdf_path: str, page: int, target_longest_image_dim: int, target_anchor_text_len: int, image_rotation: int = 0) -> dict:
+    """
+    Build llm request body for single page.
+    convert page content into an image firstly.
+    """
     MAX_TOKENS = 3000
     assert image_rotation in [0, 90, 180, 270], "Invalid image rotation provided in build_page_query"
 
@@ -242,7 +246,9 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
             elif status_code != 200:
                 raise ValueError(f"Error http status {status_code}")
 
-            print(response_body)
+            # Print response_body for debugging.
+            # print(response_body)
+
             base_response_data = json.loads(response_body)
 
             if base_response_data["usage"]["total_tokens"] > args.model_max_context:
@@ -289,24 +295,24 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
             await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "cancelled")
             raise
         except json.JSONDecodeError as e:
+            logger.warning(f"JSON decode error on attempt {attempt} for {pdf_orig_path}-{page_num}: {e}")
+            attempt += 1
             # Debugging, view raw response
             print(f"----------------------------------------------------------------------------")
             print(f"Raw response: {response_body}")
             print(f"----------------------------------------------------------------------------")
-            logger.warning(f"JSON decode error on attempt {attempt} for {pdf_orig_path}-{page_num}: {e}")
-            attempt += 1
         except ValueError as e:
-            print(f"----------------------------------------------------------------------------")
-            print(f"Raw response: {response_body}")
-            print(f"----------------------------------------------------------------------------")
             logger.warning(f"ValueError on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
             attempt += 1
-        except Exception as e:
             print(f"----------------------------------------------------------------------------")
             print(f"Raw response: {response_body}")
             print(f"----------------------------------------------------------------------------")
+        except Exception as e:
             logger.exception(f"Unexpected error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
             attempt += 1
+            print(f"----------------------------------------------------------------------------")
+            print(f"Raw response: {response_body}")
+            print(f"----------------------------------------------------------------------------")
 
     logger.error(f"Failed to process {pdf_orig_path}-{page_num} after {MAX_RETRIES} attempts.")
     await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "errored")
