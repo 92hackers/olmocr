@@ -14,10 +14,11 @@ ps aux | grep python | grep -v grep | awk '{print $2}' | xargs kill -9
 ps aux | grep sglang | grep -v grep | awk '{print $2}' | xargs kill -9
 
 pdf_files=./tests/gnarly_pdfs/horribleocr.pdf
+model_path=/root/.cache/modelscope/hub/models/allenai/olmOCR-7B-0225-preview
 
 python -m olmocr.pipeline ./localworkspace \
   --pdfs $pdf_files \
   --max_page_retries 2 \
   --workers 2 \
-  --model /root/.cache/modelscope/hub/models/allenai/olmOCR-7B-0225-preview
+  --model $model_path
   # Specify a custom model path, such as downloaded with modelscope.
