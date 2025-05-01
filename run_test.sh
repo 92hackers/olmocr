@@ -18,3 +18,5 @@ python -m olmocr.pipeline ./localworkspace \
   --pdfs $pdf_files \
   --max_page_retries 2 \
   --workers 2 \
+  --model /root/.cache/modelscope/hub/models/allenai/olmOCR-7B-0225-preview
+  # Specify a custom model path, such as downloaded with modelscope.

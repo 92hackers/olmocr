@@ -242,6 +242,7 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
             elif status_code != 200:
                 raise ValueError(f"Error http status {status_code}")
 
+            print(response_body)
             base_response_data = json.loads(response_body)
 
             if base_response_data["usage"]["total_tokens"] > args.model_max_context:
