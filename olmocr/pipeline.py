@@ -89,6 +89,9 @@ SGLANG_SERVER_PORT = 30024
 # Record error processing files
 ERROR_PROCESING_FILES_LOG_FILE = "olmocr_error_processing_files"
 
+# Page delimiter, to concatenate the pages together.
+PAGE_DELIMITER = "\n\n-------------- page --------------\n\n"
+
 def log_error_processing_file(file_path):
     """
     Log the file path of a PDF that failed to process.
@@ -413,7 +416,9 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
                     f"Document {pdf_orig_path} processed with {num_fallback_pages} fallback pages out of {num_pages}, proceeding to build Dolma document."
                 )
 
-            return build_dolma_document(pdf_orig_path, page_results)
+            concate_doc_pages_and_save(pdf_orig_path, page_results)
+            return None
+            #return build_dolma_document(pdf_orig_path, page_results)
         except Exception as e:
             # Check for ExceptionGroup with BrokenProcessPool
             if isinstance(e, ExceptionGroup):
@@ -422,12 +427,36 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
                     logger.critical("Encountered BrokenProcessPool, exiting process.")
                     sys.exit(1)
 
-            logger.exception(f"Exception in process_pdf for {pdf_orig_path}: {e}")
+            logger.exception(f"Exception in process_pdf function for {pdf_orig_path}: {e}")
             # Log the error processing file
             log_error_processing_file(pdf_orig_path)
             # You can't build a dolma doc with even 1 failed page, so just get out of here
             # However, you don't want to propagate an exception higher up and cancel the entire work_group
             return None
+
+
+
+def concate_doc_pages_and_save(pdf_orig_path, page_results):
+    """
+    Concatenate the pages together with a delimiter, and then save the document text.
+    """
+    document_text = ""
+    for index, page in enumerate(page_results):
+        if page.response.natural_text is not None:
+            content = page.response.natural_text + ("\n" if index < len(page_results) - 1 else "")
+        else:
+            content = ""
+        document_text += content + PAGE_DELIMITER if len(content) > 0 else "" # Only add the delimiter if there is actual content
+    if not document_text:
+        logger.info(f"No document text extracted for document: {pdf_orig_path}")
+        # Record error file.
+        log_error_processing_file(pdf_orig_path)
+        return None  # Return None if the document text is empty
+    # Save the document text to a file
+    content_output_path = os.path.join(os.path.dirname(pdf_orig_path), f"{os.path.basename(pdf_orig_path)}.txt")
+    with open(content_output_path, 'w', encoding='utf-8') as f:
+        f.write(document_text)
+    logger.info(f"----------- Saved document text to {content_output_path} -----------")
 
 
 def build_dolma_document(pdf_orig_path, page_results):
@@ -517,28 +546,29 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
 
             logger.info(f"Got {len(dolma_docs)} docs for {work_item.hash}")
 
-            # Write all Dolma documents to a single local temporary file in JSONL format
-            with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tf:
-                # Iterate over the dolma_docs and append each one to the file.
-                for doc in dolma_docs:
-                    tf.write(json.dumps(doc))
-                    tf.write("\n")
-                tf.flush()
+            if len(dolma_docs) > 0:
+                # Write all Dolma documents to a single local temporary file in JSONL format
+                with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tf:
+                    # Iterate over the dolma_docs and append each one to the file.
+                    for doc in dolma_docs:
+                        tf.write(json.dumps(doc))
+                        tf.write("\n")
+                    tf.flush()
 
-                # Define the output S3 path using the work_hash
-                output_final_path = os.path.join(args.workspace, "results", f"output_{work_item.hash}.jsonl")
+                    # Define the output S3 path using the work_hash
+                    output_final_path = os.path.join(args.workspace, "results", f"output_{work_item.hash}.jsonl")
 
-                if output_final_path.startswith("s3://"):
-                    bucket, key = parse_s3_path(output_final_path)
-                    workspace_s3.upload_file(tf.name, bucket, key)
-                else:
-                    shutil.copyfile(tf.name, output_final_path)
+                    if output_final_path.startswith("s3://"):
+                        bucket, key = parse_s3_path(output_final_path)
+                        workspace_s3.upload_file(tf.name, bucket, key)
+                    else:
+                        shutil.copyfile(tf.name, output_final_path)
 
-            # Update finished token counts from successful documents
-            metrics.add_metrics(
-                finished_input_tokens=sum(doc["metadata"]["total-input-tokens"] for doc in dolma_docs),
-                finished_output_tokens=sum(doc["metadata"]["total-output-tokens"] for doc in dolma_docs),
-            )
+                # Update finished token counts from successful documents
+                metrics.add_metrics(
+                    finished_input_tokens=sum(doc["metadata"]["total-input-tokens"] for doc in dolma_docs),
+                    finished_output_tokens=sum(doc["metadata"]["total-output-tokens"] for doc in dolma_docs),
+                )
 
             await work_queue.mark_done(work_item)
         except Exception as e:
