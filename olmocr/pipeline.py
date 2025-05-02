@@ -92,13 +92,16 @@ ERROR_PROCESING_FILES_LOG_FILE = "olmocr_error_processing_files"
 # Page delimiter, to concatenate the pages together.
 PAGE_DELIMITER = "\n\n-------------- page --------------\n\n"
 
+# Global timestamp for logging
+global_timestamp = time.strftime("%Y%m%d_%H%M%S")
+
 def log_error_processing_file(file_path):
     """
     Log the file path of a PDF that failed to process.
+    All error processing files will be logged to a single file.
     """
     print(f"Logging error processing file: {file_path}")
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    error_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{ERROR_PROCESING_FILES_LOG_FILE}_{timestamp}.log")
+    error_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{ERROR_PROCESING_FILES_LOG_FILE}_{global_timestamp}.log")
     with open(error_file, "a") as f:
         f.write(f"{file_path}\n")
 
