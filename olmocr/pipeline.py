@@ -435,6 +435,11 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
             return None
 
 
+def get_txt_file_path(file_path):
+    """
+    Get the text file path for a given PDF file path.
+    """
+    return os.path.join(os.path.dirname(file_path), f"{os.path.basename(file_path)}.txt")
 
 def concate_doc_pages_and_save(pdf_orig_path, page_results):
     """
@@ -453,7 +458,7 @@ def concate_doc_pages_and_save(pdf_orig_path, page_results):
         log_error_processing_file(pdf_orig_path)
         return None  # Return None if the document text is empty
     # Save the document text to a file
-    content_output_path = os.path.join(os.path.dirname(pdf_orig_path), f"{os.path.basename(pdf_orig_path)}.txt")
+    content_output_path = get_txt_file_path(pdf_orig_path)
     with open(content_output_path, 'w', encoding='utf-8') as f:
         f.write(document_text)
     logger.info(f"----------- Saved document text to {content_output_path} -----------")
@@ -766,6 +771,8 @@ async def main():
     parser.add_argument("--port", type=int, default=30024, help="Port to use for the SGLang server")
     args = parser.parse_args()
 
+    start_time = time.time()
+
     global workspace_s3, pdf_s3
     # set the global SGLANG_SERVER_PORT from args
     global SGLANG_SERVER_PORT
@@ -788,8 +795,8 @@ async def main():
     else:
         work_queue = LocalWorkQueue(args.workspace)
 
+    pdf_work_paths = set()
     if args.pdfs:
-        pdf_work_paths = set()
         logger.info("Got --pdfs argument, going to add to the work queue")
 
         for pdf_path in args.pdfs:
@@ -798,6 +805,11 @@ async def main():
                 logger.info(f"Expanding s3 glob at {pdf_path}")
                 pdf_work_paths |= set(expand_s3_glob(pdf_s3, pdf_path))
             elif os.path.exists(pdf_path):
+                # Check if the corresponding .txt file exists
+                if get_txt_file_path(pdf_path):
+                    logger.info(f"Found .txt file for: {pdf_path}, skipping it")
+                    continue
+
                 if (
                     pdf_path.lower().endswith(".pdf")
                     or pdf_path.lower().endswith(".png")
@@ -893,6 +905,11 @@ async def main():
 
     metrics_task.cancel()
     logger.info("Work done")
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    logger.info(f"Total time taken: {elapsed_time:.2f} seconds")
+    logger.info(f"Total time taken: {elapsed_time / 60:.2f} minutes")
+    logger.info(f"Total documents processed: {len(pdf_work_paths):,}")
 
 
 if __name__ == "__main__":
