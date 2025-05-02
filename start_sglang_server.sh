@@ -12,7 +12,7 @@ SGLANG_SERVER_PORT=30024
 # --mem-fraction-static 0.8 : # For less-than 60G gpu memory.
 python3 -m sglang.launch_server \
   --model-path $model \
-  --context-length 8192 \
+  --context-length 32000 \
   --chat-template qwen2-vl \
   --mem-fraction-static 0.8 \
   --host localhost \

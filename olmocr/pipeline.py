@@ -145,6 +145,7 @@ async def build_page_query(local_pdf_path: str, page: int, target_longest_image_
         # Encode the rotated image back to base64
         image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
+    # TODO: qwen2.5-vl-7b-instruct 更加强大，上下文更长，值得升级: total: 131,072, input: 129,024, output: 8192.
     return {
         "model": "Qwen/Qwen2-VL-7B-Instruct",
         "messages": [
