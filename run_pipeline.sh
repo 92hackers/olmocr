@@ -10,8 +10,8 @@ set -x
 bash ./check_deps.sh
 
 # Kill any existing python processes, sglang .
-ps aux | grep python | grep -v grep | awk '{print $2}' | xargs kill -9
-ps aux | grep sglang | grep -v grep | awk '{print $2}' | xargs kill -9
+# ps aux | grep python | grep -v grep | awk '{print $2}' | xargs kill -9
+# ps aux | grep sglang | grep -v grep | awk '{print $2}' | xargs kill -9
 
 pdf_files=./tests/gnarly_pdfs/horribleocr.pdf
 model_path=/root/.cache/modelscope/hub/models/allenai/olmOCR-7B-0225-preview

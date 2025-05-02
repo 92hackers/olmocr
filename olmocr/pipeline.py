@@ -1,6 +1,5 @@
 import argparse
 import asyncio
-import atexit
 import base64
 import datetime
 import hashlib
@@ -14,6 +13,7 @@ import shutil
 import sys
 import tempfile
 import time
+
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -23,9 +23,7 @@ from urllib.parse import urlparse
 
 import boto3
 import httpx
-import torch
 from botocore.exceptions import ClientError
-from huggingface_hub import snapshot_download
 from PIL import Image
 from pypdf import PdfReader
 from tqdm import tqdm
@@ -42,7 +40,6 @@ from olmocr.metrics import MetricsKeeper, WorkerTracker
 from olmocr.prompts import PageResponse, build_finetuning_prompt
 from olmocr.prompts.anchor import get_anchor_text
 from olmocr.s3_utils import (
-    download_directory,
     download_zstd_csv,
     expand_s3_glob,
     get_s3_bytes,
@@ -57,9 +54,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logger.propagate = False
 
-sglang_logger = logging.getLogger("sglang")
-sglang_logger.propagate = False
-
 file_handler = logging.FileHandler("olmocr-pipeline-debug.log", mode="a")
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
@@ -71,7 +65,6 @@ console_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(level
 # Add handlers to the logger
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
-sglang_logger.addHandler(file_handler)
 
 # Quiet logs from pypdf
 logging.getLogger("pypdf").setLevel(logging.ERROR)
@@ -554,130 +547,6 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
             semaphore.release()
 
 
-async def sglang_server_task(model_name_or_path, args, semaphore):
-    # Check GPU memory, lower mem devices need a bit less KV cache space because the VLM takes additional memory
-    gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # Convert to GB
-    mem_fraction_arg = ["--mem-fraction-static", "0.80"] if gpu_memory < 60 else []
-
-    cmd = [
-        "python3",
-        "-m",
-        "sglang.launch_server",
-        "--model-path",
-        model_name_or_path,
-        "--chat-template",
-        args.model_chat_template,
-        # "--context-length", str(args.model_max_context),  # Commented out due to crashes
-        "--port",
-        str(SGLANG_SERVER_PORT),
-        "--log-level-http",
-        "warning",
-    ]
-    cmd.extend(mem_fraction_arg)
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    # Ensure the subprocess is terminated on exit
-    def _kill_proc():
-        proc.terminate()
-
-    atexit.register(_kill_proc)
-
-    # Shared variables between tasks
-    last_running_req, last_queue_req = 0, 0
-    server_printed_ready_message = False
-    last_semaphore_release = time.time()
-
-    async def process_line(line):
-        nonlocal last_running_req, last_queue_req, last_semaphore_release, server_printed_ready_message
-        sglang_logger.info(line)
-
-        # if the server hasn't initialized yet, log all the lines to the main logger also, so that the user
-        # can see any warnings/errors more easily
-        if not server_printed_ready_message:
-            logger.info(line)
-
-        if "Detected errors during sampling" in line:
-            logger.error("Cannot continue, sampling errors detected, model is probably corrupt")
-            sys.exit(1)
-
-        # TODO, need to trace down this issue in sglang itself, but it will otherwise cause the server to lock up
-        if "IndexError: list index out of range" in line:
-            logger.error("IndexError in model, restarting server")
-            proc.terminate()
-
-        if not server_printed_ready_message and "The server is fired up and ready to roll!" in line:
-            server_printed_ready_message = True
-            last_semaphore_release = time.time()
-
-        match = re.search(r"#running-req: (\d+)", line)
-        if match:
-            last_running_req = int(match.group(1))
-
-        match = re.search(r"#queue-req: (\d+)", line)
-        if match:
-            last_queue_req = int(match.group(1))
-            logger.info(f"sglang running req: {last_running_req} queue req: {last_queue_req}")
-
-    async def read_stream(stream):
-        while True:
-            line = await stream.readline()
-            if not line:
-                break
-            try:
-                line = line.decode("utf-8").rstrip()
-                await process_line(line)
-            except Exception as ex:
-                logger.warning(f"Got {ex} when reading log line from inference server, skipping")
-
-    async def timeout_task():
-        nonlocal last_running_req, last_queue_req, last_semaphore_release
-        try:
-            while True:
-                await asyncio.sleep(1)
-                if server_printed_ready_message and last_queue_req == 0 and time.time() - last_semaphore_release > 30 and semaphore.locked():
-                    semaphore.release()
-                    last_semaphore_release = time.time()
-                    logger.info("Semaphore released, allowing a worker to proceed.")
-        except asyncio.CancelledError:
-            pass  # Clean up if the task is cancelled
-
-    # Start tasks to read stdout, stderr, and handle timeout logic
-    stdout_task = asyncio.create_task(read_stream(proc.stdout))
-    stderr_task = asyncio.create_task(read_stream(proc.stderr))
-    timeout_task = asyncio.create_task(timeout_task())
-
-    try:
-        await proc.wait()
-    except asyncio.CancelledError:
-        logger.info("Got cancellation request for SGLang server")
-        proc.terminate()
-        raise
-
-    timeout_task.cancel()
-    await asyncio.gather(stdout_task, stderr_task, timeout_task, return_exceptions=True)
-
-
-async def sglang_server_host(model_name_or_path, args, semaphore):
-    MAX_RETRIES = 5
-    retry = 0
-
-    while retry < MAX_RETRIES:
-        await sglang_server_task(model_name_or_path, args, semaphore)
-        logger.warning("SGLang server task ended")
-        retry += 1
-
-    if retry >= MAX_RETRIES:
-        logger.error(f"Ended up starting the sglang server more than {retry} times, cancelling pipeline")
-        logger.error("")
-        logger.error("Please make sure sglang is installed according to the latest instructions here: https://docs.sglang.ai/start/install.html")
-        sys.exit(1)
-
-
 async def sglang_server_ready():
     max_attempts = 300
     delay_sec = 1
@@ -699,21 +568,6 @@ async def sglang_server_ready():
         await asyncio.sleep(delay_sec)
 
     raise Exception("sglang server did not become ready after waiting.")
-
-
-async def download_model(model_name_or_path: str):
-    if model_name_or_path.startswith("s3://") or model_name_or_path.startswith("gs://") or model_name_or_path.startswith("weka://"):
-        logger.info(f"Downloading model directory from '{model_name_or_path}'")
-        model_cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "olmocr", "model")
-        download_directory([model_name_or_path], model_cache_dir)
-        return model_cache_dir
-    elif os.path.isabs(model_name_or_path) and os.path.isdir(model_name_or_path):
-        logger.info(f"Using local model path at '{model_name_or_path}'")
-        return model_name_or_path
-    else:
-        logger.info(f"Downloading model with hugging face '{model_name_or_path}'")
-        snapshot_download(repo_id=model_name_or_path)
-        return model_name_or_path
 
 
 async def metrics_reporter(work_queue):
@@ -905,8 +759,8 @@ async def main():
         work_queue = LocalWorkQueue(args.workspace)
 
     if args.pdfs:
-        logger.info("Got --pdfs argument, going to add to the work queue")
         pdf_work_paths = set()
+        logger.info("Got --pdfs argument, going to add to the work queue")
 
         for pdf_path in args.pdfs:
             # Expand s3 paths
@@ -968,20 +822,16 @@ async def main():
         logger.info(f"Calculated items_per_group: {items_per_group} based on average pages per PDF: {avg_pages_per_pdf:.2f}")
 
         # Now call populate_queue
-        await work_queue.populate_queue(pdf_work_paths, items_per_group)
+        await work_queue.populate_queue(list(pdf_work_paths), items_per_group)
 
     if args.stats:
         print_stats(args)
         return
 
-    # If you get this far, then you are doing inference and need a GPU
     check_sglang_version()
     check_torch_gpu_available()
 
     logger.info(f"Starting pipeline with PID {os.getpid()}")
-
-    # Download the model before you do anything else
-    model_name_or_path = await download_model(args.model)
 
     # Initialize the work queue
     qsize = await work_queue.initialize_queue()
@@ -994,8 +844,6 @@ async def main():
     # This lets us get full utilization by having many workers, but also to be outputting dolma docs as soon as possible
     # As soon as one worker is no longer saturating the gpu, the next one can start sending requests
     semaphore = asyncio.Semaphore(1)
-
-    sglang_server = asyncio.create_task(sglang_server_host(model_name_or_path, args, semaphore))
 
     await sglang_server_ready()
 
@@ -1013,7 +861,6 @@ async def main():
     # Wait for server to stop
     process_pool.shutdown(wait=False)
 
-    sglang_server.cancel()
     metrics_task.cancel()
     logger.info("Work done")
 
