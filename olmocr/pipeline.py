@@ -353,7 +353,7 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
     Process a single PDF document, a document can be a single page or multiple pages.
     """
     # Check if txt file already exists in the same dir, If you still want to process it, you can delete the txt file firstly!
-    if get_txt_file_path(pdf_orig_path):
+    if check_txt_file_exists(pdf_orig_path):
         logger.info(f"Found .txt file for: {pdf_orig_path}, skipping it")
         return None
 
@@ -445,6 +445,13 @@ def get_txt_file_path(file_path):
     Get the text file path for a given PDF file path.
     """
     return os.path.join(os.path.dirname(file_path), f"{os.path.basename(file_path)}.txt")
+
+def check_txt_file_exists(file_path):
+    """
+    Check if the text file exists for a given PDF file path.
+    """
+    txt_file_path = get_txt_file_path(file_path)
+    return os.path.exists(txt_file_path)
 
 def concate_doc_pages_and_save(pdf_orig_path, page_results):
     """
@@ -811,7 +818,7 @@ async def main():
                 pdf_work_paths |= set(expand_s3_glob(pdf_s3, pdf_path))
             elif os.path.exists(pdf_path):
                 # Check if the corresponding .txt file exists
-                if get_txt_file_path(pdf_path):
+                if check_txt_file_exists(pdf_path):
                     logger.info(f"Found .txt file for: {pdf_path}, skipping it")
                     continue
 
@@ -829,7 +836,7 @@ async def main():
                         pdf_work_paths.add(pdf_path)
                     else:
                         logger.warning(f"File at {pdf_path} is not a valid PDF")
-                elif pdf_path.lower().endswith(".txt"):
+                elif pdf_path.lower().endswith(".log"):
                     logger.info(f"Loading file at {pdf_path} as list of paths")
                     with open(pdf_path, "r") as f:
                         pdf_work_paths |= set(filter(None, (line.strip() for line in f)))
