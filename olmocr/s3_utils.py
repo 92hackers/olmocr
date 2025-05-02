@@ -85,7 +85,7 @@ def expand_s3_glob(s3_client, s3_glob: str) -> dict[str, str]:
 
 
 def get_s3_bytes(s3_client, s3_path: str, start_index: Optional[int] = None, end_index: Optional[int] = None) -> bytes:
-    # Fall back for local files
+    # Fall back to local file
     if os.path.exists(s3_path):
         assert start_index is None and end_index is None, "Range query not supported yet"
         with open(s3_path, "rb") as f:

@@ -93,6 +93,19 @@ get_pdf_filter = cache(lambda: PdfFilter(languages_to_keep={Language.ENGLISH, No
 # Specify a default port, but it can be overridden by args
 SGLANG_SERVER_PORT = 30024
 
+# Record error processing files
+ERROR_PROCESING_FILES_LOG_FILE = "olmocr_error_processing_files"
+
+def log_error_processing_file(file_path):
+    """
+    Log the file path of a PDF that failed to process.
+    """
+    print(f"Logging error processing file: {file_path}")
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    error_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{ERROR_PROCESING_FILES_LOG_FILE}_{timestamp}.log")
+    with open(error_file, "a") as f:
+        f.write(f"{file_path}\n")
+
 
 @dataclass(frozen=True)
 class PageResult:
@@ -156,7 +169,7 @@ async def build_page_query(local_pdf_path: str, page: int, target_longest_image_
 # It feels strange perhaps, but httpx and aiohttp are very complex beasts
 # Ex. the sessionpool in httpcore has 4 different locks in it, and I've noticed
 # that at the scale of 100M+ requests, that they deadlock in different strange ways
-async def apost(url, json_data):
+async def async_post(url, json_data):
     parsed_url = urlparse(url)
     host = parsed_url.hostname
     port = parsed_url.port or 80
@@ -219,6 +232,9 @@ async def apost(url, json_data):
 
 # Actually requesting the page content to the SGLang server model api, to extract the anchor text and the page content
 async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path: str, page_num: int) -> PageResult:
+    """
+    Process a single page of a PDF document.
+    """
     COMPLETION_URL = f"http://localhost:{SGLANG_SERVER_PORT}/v1/chat/completions"
     MAX_RETRIES = args.max_page_retries
     TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
@@ -235,9 +251,10 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
         ]  # Change temperature as number of attempts increases to overcome repetition issues at expense of quality
 
         logger.info(f"Built page query for {pdf_orig_path}-{page_num}")
+        response_body = None
 
         try:
-            status_code, response_body = await apost(COMPLETION_URL, json_data=query)
+            status_code, response_body = await async_post(COMPLETION_URL, json_data=query)
 
             if status_code == 400:
                 raise ValueError(f"Got BadRequestError from server: {response_body}, skipping this response")
@@ -272,10 +289,11 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
                 raise ValueError(f"invalid_page rotation for {pdf_orig_path}-{page_num}")
 
             await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "finished")
+            # Successfully processed the page, return the result.
             return PageResult(
                 pdf_orig_path,
                 page_num,
-                page_response,
+                page_response, # Page content.
                 input_tokens=base_response_data["usage"].get("prompt_tokens", 0),
                 output_tokens=base_response_data["usage"].get("completion_tokens", 0),
                 is_fallback=False,
@@ -335,6 +353,10 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
 
 
 async def process_pdf(args, worker_id: int, pdf_orig_path: str):
+    """
+    Process a single PDF document, a document can be a single page or multiple pages.
+    """
+    # Write the PDF to a temporary file, either a local file or an S3 file.
     with tempfile.NamedTemporaryFile("wb+", suffix=".pdf") as tf:
         try:
             data = await asyncio.to_thread(lambda: get_s3_bytes_with_backoff(pdf_s3, pdf_orig_path))
@@ -347,14 +369,17 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
             else:
                 raise
 
-        if is_png(tf.name) or is_jpeg(tf.name):
+        pdf_local_path = tf.name
+
+        if is_png(pdf_local_path) or is_jpeg(pdf_local_path):
             logger.info(f"Converting {pdf_orig_path} from image to PDF format...")
             tf.seek(0)
-            tf.write(convert_image_to_pdf_bytes(tf.name))
+            tf.write(convert_image_to_pdf_bytes(pdf_local_path))
             tf.flush()
 
         try:
-            reader = PdfReader(tf.name)
+            # Read the PDF file from the temporary file to count the number of pages
+            reader = PdfReader(pdf_local_path)
             num_pages = reader.get_num_pages()
         except:
             logger.exception(f"Could not count number of pages for {pdf_orig_path}, aborting document")
@@ -362,7 +387,7 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
 
         logger.info(f"Got {num_pages} pages to do for {pdf_orig_path} in worker {worker_id}")
 
-        if args.apply_filter and get_pdf_filter().filter_out_pdf(tf.name):
+        if args.apply_filter and get_pdf_filter().filter_out_pdf(pdf_local_path):
             logger.info(f"Filtering out pdf {pdf_orig_path}")
             return None
 
@@ -372,8 +397,9 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
 
         try:
             async with asyncio.TaskGroup() as tg:
+                # Iterate all pages and create tasks for each page.
                 for page_num in range(1, num_pages + 1):
-                    task = tg.create_task(process_page(args, worker_id, pdf_orig_path, tf.name, page_num))
+                    task = tg.create_task(process_page(args, worker_id, pdf_orig_path, pdf_local_path, page_num))
                     page_tasks.append(task)
 
             # Collect the results from the entire task group, assuming no exceptions
@@ -381,10 +407,13 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
 
             num_fallback_pages = sum(page_result.is_fallback for page_result in page_results)
 
+            # Check if the number of fallback pages exceeds the allowed error rate.
             if num_fallback_pages / num_pages > args.max_page_error_rate:
                 logger.error(
                     f"Document {pdf_orig_path} has {num_fallback_pages} fallback pages out of {num_pages} exceeding max_page_error_rate of {args.max_page_error_rate}, discarding document."
                 )
+                # Log the error processing file
+                log_error_processing_file(pdf_orig_path)
                 return None
             elif num_fallback_pages > 0:
                 logger.warning(
@@ -401,13 +430,15 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
                     sys.exit(1)
 
             logger.exception(f"Exception in process_pdf for {pdf_orig_path}: {e}")
+            # Log the error processing file
+            log_error_processing_file(pdf_orig_path)
             # You can't build a dolma doc with even 1 failed page, so just get out of here
             # However, you don't want to propagate an exception higher up and cancel the entire work_group
             return None
 
 
 def build_dolma_document(pdf_orig_path, page_results):
-    # Build the document text and page spans
+    # Build the document text content and page spans
     document_text = ""
     pdf_page_spans = []
     current_char_pos = 0
@@ -425,6 +456,8 @@ def build_dolma_document(pdf_orig_path, page_results):
 
     if not document_text:
         logger.info(f"No document text for {pdf_orig_path}")
+        # Record error file.
+        log_error_processing_file(pdf_orig_path)
         return None  # Return None if the document text is empty
 
     # Build the Dolma document
@@ -452,6 +485,9 @@ def build_dolma_document(pdf_orig_path, page_results):
 
 
 async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
+    """
+    Worker function to process work items from the work queue.
+    """
     while True:
         # Wait until allowed to proceed
         await semaphore.acquire()
@@ -474,20 +510,23 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
             logger.info(f"Finished TaskGroup for worker on {work_item.hash}")
 
             dolma_docs = []
+            result = None
+
             for task in dolma_tasks:
                 try:
                     result = task.result()
-                except:
+                except Exception as e:
                     # some dolma doc creations may have failed
-                    pass
-
+                    logger.error(f"Got exception {e} when processing work item {work_item.hash}, skipping this document")
+                    logger.error(work_item.work_paths)
                 if result is not None:
                     dolma_docs.append(result)
 
             logger.info(f"Got {len(dolma_docs)} docs for {work_item.hash}")
 
-            # Write the Dolma documents to a local temporary file in JSONL format
+            # Write all Dolma documents to a single local temporary file in JSONL format
             with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tf:
+                # Iterate over the dolma_docs and append each one to the file.
                 for doc in dolma_docs:
                     tf.write(json.dumps(doc))
                     tf.write("\n")
