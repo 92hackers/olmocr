@@ -352,6 +352,11 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
     """
     Process a single PDF document, a document can be a single page or multiple pages.
     """
+    # Check if txt file already exists in the same dir, If you still want to process it, you can delete the txt file firstly!
+    if get_txt_file_path(pdf_orig_path):
+        logger.info(f"Found .txt file for: {pdf_orig_path}, skipping it")
+        return None
+
     # Write the PDF to a temporary file, either a local file or an S3 file.
     with tempfile.NamedTemporaryFile("wb+", suffix=".pdf") as tf:
         try:
