@@ -2,7 +2,7 @@ import json
 import os
 from typing import Literal
 
-from openai import OpenAI
+from openai import AzureOpenAI
 
 from olmocr.bench.prompts import build_basic_prompt
 from olmocr.data.renderpdf import render_pdf_to_base64png
@@ -14,15 +14,12 @@ from olmocr.prompts.prompts import (
     openai_response_format_schema,
 )
 
-
 def run_chatgpt(
     pdf_path: str,
     page_num: int = 1,
-    model: str = "gpt-4o-2024-08-06",
-    temperature: float = 0.1,
     target_longest_image_dim: int = 2048,
-    prompt_template: Literal["full", "basic", "finetune"] = "finetune",
-    response_template: Literal["plain", "json"] = "json",
+    prompt_template: Literal["full", "basic", "finetune"] = "full",
+    response_template: Literal["plain", "json"] = "plain",
 ) -> str:
     """
     Convert page of a PDF file to markdown using the commercial openAI APIs.
@@ -42,7 +39,17 @@ def run_chatgpt(
     if not os.getenv("OPENAI_API_KEY"):
         raise SystemExit("You must specify an OPENAI_API_KEY")
 
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    endpoint = "https://sendi-chatgpt.openai.azure.com/"
+    deployment = "gpt-4o"
+
+    subscription_key = os.getenv("OPENAI_API_KEY")
+    api_version = "2024-12-01-preview"
+
+    client = AzureOpenAI(
+        api_version=api_version,
+        azure_endpoint=endpoint,
+        api_key=subscription_key,
+    )
 
     if prompt_template == "full":
         prompt = build_openai_silver_data_prompt(anchor_text)
@@ -53,8 +60,8 @@ def run_chatgpt(
     else:
         raise ValueError("Unknown prompt template")
 
+
     response = client.chat.completions.create(
-        model=model,
         messages=[
             {
                 "role": "user",
@@ -64,9 +71,11 @@ def run_chatgpt(
                 ],
             }
         ],
-        temperature=temperature,
-        max_tokens=3000,
-        response_format=openai_response_format_schema() if response_template == "json" else None,
+        max_tokens=4096,
+        temperature=0.7,
+        top_p=1.0,
+        model=deployment,
+        response_format=openai_response_format_schema() if response_template == "json" else None
     )
 
     raw_response = response.choices[0].message.content
@@ -82,3 +91,15 @@ def run_chatgpt(
         return data.natural_text
     else:
         return raw_response
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python run_chatgpt.py <pdf_path> [page_num]")
+        sys.exit(1)
+
+    pdf_path = sys.argv[1]
+    page_num = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    response = run_chatgpt(pdf_path, page_num)
+    print(response)
