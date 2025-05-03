@@ -167,7 +167,7 @@ async def build_page_query(local_pdf_path: str, page: int, target_longest_image_
             }
         ],
         "max_tokens": MAX_TOKENS,
-        "temperature": 0.0,
+        "temperature": 0.7,
     }
 
 
@@ -243,7 +243,7 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
     """
     COMPLETION_URL = f"{SGLANG_SERVER_URL}/v1/chat/completions"
     MAX_RETRIES = args.max_page_retries
-    TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    # TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
     exponential_backoffs = 0
     local_anchor_text_len = args.target_anchor_text_len
     local_image_rotation = 0
@@ -252,9 +252,9 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
 
     while attempt < MAX_RETRIES:
         query = await build_page_query(pdf_local_path, page_num, args.target_longest_image_dim, local_anchor_text_len, image_rotation=local_image_rotation)
-        query["temperature"] = TEMPERATURE_BY_ATTEMPT[
-            min(attempt, len(TEMPERATURE_BY_ATTEMPT) - 1)
-        ]  # Change temperature as number of attempts increases to overcome repetition issues at expense of quality
+        # query["temperature"] = TEMPERATURE_BY_ATTEMPT[
+        #     min(attempt, len(TEMPERATURE_BY_ATTEMPT) - 1)
+        # ]  # Change temperature as number of attempts increases to overcome repetition issues at expense of quality
 
         logger.info(f"Built page query for {pdf_orig_path}-{page_num}")
         response_body = None
