@@ -83,8 +83,8 @@ process_pool = ProcessPoolExecutor(max_workers=min(multiprocessing.cpu_count() /
 # Filter object, cached so it will only get loaded when/if you need it
 get_pdf_filter = cache(lambda: PdfFilter(languages_to_keep={Language.ENGLISH, None}, apply_download_spam_check=True, apply_form_check=True))
 
-# Specify a default port, but it can be overridden by args
-SGLANG_SERVER_PORT = 30024
+# Specify the SGLang server URL
+SGLANG_SERVER_URL = ''
 
 # Record error processing files
 ERROR_PROCESING_FILES_LOG_FILE = "olmocr_error_processing_files"
@@ -241,7 +241,7 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
     """
     Process a single page of a PDF document.
     """
-    COMPLETION_URL = f"http://localhost:{SGLANG_SERVER_PORT}/v1/chat/completions"
+    COMPLETION_URL = f"{SGLANG_SERVER_URL}/v1/chat/completions"
     MAX_RETRIES = args.max_page_retries
     TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
     exponential_backoffs = 0
@@ -607,7 +607,7 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
 async def sglang_server_ready():
     max_attempts = 300
     delay_sec = 1
-    url = f"http://localhost:{SGLANG_SERVER_PORT}/v1/models"
+    url = f"{SGLANG_SERVER_URL}/v1/models"
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -791,14 +791,22 @@ async def main():
     parser.add_argument("--target_anchor_text_len", type=int, help="Maximum amount of anchor text to use (characters)", default=6000)
 
     parser.add_argument("--port", type=int, default=30024, help="Port to use for the SGLang server")
+    parser.add_argument("--sglang_server_url ", type=str, default='', help="Url to use for the SGLang server")
     args = parser.parse_args()
 
     start_time = time.time()
 
     global workspace_s3, pdf_s3
     # set the global SGLANG_SERVER_PORT from args
-    global SGLANG_SERVER_PORT
-    SGLANG_SERVER_PORT = args.port
+    global SGLANG_SERVER_URL
+    if args.sglang_server_url:
+        SGLANG_SERVER_URL = args.sglang_server_url
+    else:
+        print(f"Sglang server is required, please set the --sglang_server_url argument")
+        sys.exit(1)
+
+    # Check if the sglang server is connected.
+    await sglang_server_ready()
 
     if args.workspace_profile:
         workspace_session = boto3.Session(profile_name=args.workspace_profile)
@@ -908,8 +916,6 @@ async def main():
     # This lets us get full utilization by having many workers, but also to be outputting dolma docs as soon as possible
     # As soon as one worker is no longer saturating the gpu, the next one can start sending requests
     semaphore = asyncio.Semaphore(1)
-
-    await sglang_server_ready()
 
     metrics_task = asyncio.create_task(metrics_reporter(work_queue))
 
