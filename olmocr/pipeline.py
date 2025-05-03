@@ -95,15 +95,21 @@ PAGE_DELIMITER = "\n\n-------------- page --------------\n\n"
 # Global timestamp for logging
 global_timestamp = time.strftime("%Y%m%d_%H%M%S")
 
+# Global error-processing files counter
+error_processing_files_counter = 0
+
+
 def log_error_processing_file(file_path):
     """
     Log the file path of a PDF that failed to process.
     All error processing files will be logged to a single file.
     """
     print(f"Logging error processing file: {file_path}")
-    error_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"{ERROR_PROCESING_FILES_LOG_FILE}_{global_timestamp}.log")
+    error_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../", f"{ERROR_PROCESING_FILES_LOG_FILE}_{global_timestamp}.log")
     with open(error_file, "a") as f:
         f.write(f"{file_path}\n")
+    global error_processing_files_counter
+    error_processing_files_counter += 1
 
 
 @dataclass(frozen=True)
@@ -919,6 +925,8 @@ async def main():
     # Wait for server to stop
     process_pool.shutdown(wait=False)
 
+    global error_processing_files_counter
+
     metrics_task.cancel()
     logger.info("Work done")
     end_time = time.time()
@@ -926,6 +934,7 @@ async def main():
     logger.info(f"Total time taken: {elapsed_time:.2f} seconds")
     logger.info(f"Total time taken: {elapsed_time / 60:.2f} minutes")
     logger.info(f"Total documents processed: {len(pdf_work_paths):,}")
+    logger.info(f"Total error-processing documents count: {error_processing_files_counter}")
 
 
 if __name__ == "__main__":

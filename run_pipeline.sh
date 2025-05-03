@@ -9,15 +9,16 @@ set -x
 # Make sure the dependencies are correctly installed
 bash ./check_deps.sh
 
-# Kill any existing python processes, sglang .
-# ps aux | grep python | grep -v grep | awk '{print $2}' | xargs kill -9
-# ps aux | grep sglang | grep -v grep | awk '{print $2}' | xargs kill -9
+localworkspace=./localworkspace
+
+# Clear localworkspace to discard any previous cache.
+rm -rf $localworkspace
 
 pdf_files=./tests/gnarly_pdfs/horribleocr.pdf
 model_path=/root/.cache/modelscope/hub/models/allenai/olmOCR-7B-0225-preview
 
 # --max_page_error_rate 0.01: means that if more than 1% of the pages in a document fail to process, the document will be skipped.
-python -m olmocr.pipeline ./localworkspace \
+python -m olmocr.pipeline $localworkspace \
   --pdfs $pdf_files \
   --max_page_retries 2 \
   --workers 2 \
