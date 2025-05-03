@@ -791,7 +791,7 @@ async def main():
     parser.add_argument("--target_anchor_text_len", type=int, help="Maximum amount of anchor text to use (characters)", default=6000)
 
     parser.add_argument("--port", type=int, default=30024, help="Port to use for the SGLang server")
-    parser.add_argument("--sglang_server_url ", type=str, default='', help="Url to use for the SGLang server")
+    parser.add_argument("--sglang_server_url", type=str, default='', help="Url to use for the SGLang server")
     args = parser.parse_args()
 
     start_time = time.time()
