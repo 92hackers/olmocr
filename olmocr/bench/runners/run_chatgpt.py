@@ -19,7 +19,7 @@ def run_chatgpt(
     page_num: int = 1,
     target_longest_image_dim: int = 2048,
     prompt_template: Literal["full", "basic", "finetune"] = "full",
-    response_template: Literal["plain", "json"] = "plain",
+    response_template: Literal["plain", "json"] = "json",
 ) -> str:
     """
     Convert page of a PDF file to markdown using the commercial openAI APIs.
@@ -34,7 +34,8 @@ def run_chatgpt(
     """
     # Convert the first page of the PDF to a base64-encoded PNG image.
     image_base64 = render_pdf_to_base64png(pdf_path, page_num=page_num, target_longest_image_dim=target_longest_image_dim)
-    anchor_text = get_anchor_text(pdf_path, page_num, pdf_engine="pdfreport")
+    # anchor_text = get_anchor_text(pdf_path, page_num, pdf_engine="pdfreport") Azure chatgpt will not work with anchor text.
+    anchor_text = ''
 
     if not os.getenv("OPENAI_API_KEY"):
         raise SystemExit("You must specify an OPENAI_API_KEY")
@@ -75,7 +76,7 @@ def run_chatgpt(
         temperature=0.7,
         top_p=1.0,
         model=deployment,
-        response_format=openai_response_format_schema() if response_template == "json" else None
+        response_format=openai_response_format_schema()
     )
 
     raw_response = response.choices[0].message.content
@@ -87,8 +88,7 @@ def run_chatgpt(
     if response_template == "json":
         data = json.loads(raw_response)
         data = PageResponse(**data)
-
-        return data.natural_text
+        return data # type: PageResponse
     else:
         return raw_response
 
