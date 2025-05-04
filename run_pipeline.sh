@@ -25,6 +25,6 @@ rm -rf $localworkspace
 python -m olmocr.pipeline $localworkspace \
   --sglang_server_url $sglang_server_url \
   --pdfs $pdf_files \
-  --max_page_retries 2 \
+  --max_page_retries 8 \
   --workers 8 \
   --max_page_error_rate 0.5
