@@ -88,6 +88,8 @@ def run_chatgpt(
     if response_template == "json":
         data = json.loads(raw_response)
         data = PageResponse(**data)
+        print(data.natural_text)
+        print(f"Successfully get response from chatgpt API for page {page_num} of {pdf_path}")
         return data # type: PageResponse
     else:
         return raw_response
