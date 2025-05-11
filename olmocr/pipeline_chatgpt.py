@@ -32,8 +32,6 @@ from tqdm import tqdm
 
 from olmocr.check import (
     check_poppler_version,
-    check_sglang_version,
-    check_torch_gpu_available,
 )
 from olmocr.data.renderpdf import render_pdf_to_base64png
 from olmocr.filter.filter import Language, PdfFilter
@@ -94,7 +92,7 @@ SGLANG_SERVER_URL = ''
 ERROR_PROCESING_FILES_LOG_FILE = "olmocr_error_processing_files"
 
 # Page delimiter, to concatenate the pages together.
-PAGE_DELIMITER = "\n\n-------------- page --------------\n\n"
+PAGE_DELIMITER = "-------------- page --------------"
 
 # Global timestamp for logging
 global_timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -125,54 +123,6 @@ class PageResult:
     input_tokens: int
     output_tokens: int
     is_fallback: bool
-
-
-async def build_page_query(local_pdf_path: str, page: int, target_longest_image_dim: int, target_anchor_text_len: int, image_rotation: int = 0) -> dict:
-    """
-    Build llm request body for single page.
-    convert page content into an image firstly.
-    """
-    MAX_TOKENS = 3000
-    assert image_rotation in [0, 90, 180, 270], "Invalid image rotation provided in build_page_query"
-
-    # Allow the page rendering to process in the background while we get the anchor text (which blocks the main thread)
-    image_base64 = asyncio.to_thread(render_pdf_to_base64png, local_pdf_path, page, target_longest_image_dim=target_longest_image_dim)
-
-    # GET ANCHOR TEXT IS NOT THREAD SAFE!! Ahhhh..... don't try to do it
-    # and it's also CPU bound, so it needs to run in a process pool
-    loop = asyncio.get_running_loop()
-    anchor_text = loop.run_in_executor(
-        process_pool, partial(get_anchor_text, pdf_engine="pdfreport", target_length=target_anchor_text_len), local_pdf_path, page
-    )
-
-    image_base64, anchor_text = await asyncio.gather(image_base64, anchor_text)  # type: ignore
-    if image_rotation != 0:
-        image_bytes = base64.b64decode(image_base64)
-        with Image.open(BytesIO(image_bytes)) as img:
-            rotated_img = img.rotate(-image_rotation, expand=True)
-
-            # Save the rotated image to a bytes buffer
-            buffered = BytesIO()
-            rotated_img.save(buffered, format="PNG")
-
-        # Encode the rotated image back to base64
-        image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-
-    # TODO: qwen2.5-vl-7b-instruct 更加强大，上下文更长，值得升级: total: 131,072, input: 129,024, output: 8192.
-    return {
-        "model": "Qwen/Qwen2-VL-7B-Instruct",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": build_finetuning_prompt(anchor_text)},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
-                ],
-            }
-        ],
-        "max_tokens": MAX_TOKENS,
-        "temperature": 0.7,
-    }
 
 
 # Manual simple implementation of HTTP Post
@@ -863,9 +813,6 @@ async def main():
     if args.stats:
         print_stats(args)
         return
-
-    check_sglang_version()
-    check_torch_gpu_available()
 
     logger.info(f"Starting pipeline with PID {os.getpid()}")
 

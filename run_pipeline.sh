@@ -11,10 +11,10 @@ SGLANG_SERVER_PORT=30024
 
 sglang_server_url=http://$SGLANG_SERVER_HOST:$SGLANG_SERVER_PORT
 
-pdf_files=./tests/gnarly_pdfs/horribleocr.pdf
+pdf_files=/home/cy/projects/large-language-model/open-webui/backend/extract_errors_pdf_filepaths_20250510_225826.log
 
 # Make sure the dependencies are correctly installed
-bash ./check_deps.sh
+#bash ./check_deps.sh
 
 localworkspace=./localworkspace
 
@@ -27,4 +27,5 @@ python -m olmocr.pipeline $localworkspace \
   --pdfs $pdf_files \
   --max_page_retries 8 \
   --workers 8 \
+  --model_max_context 32000 \
   --max_page_error_rate 0.5

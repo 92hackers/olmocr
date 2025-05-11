@@ -30,8 +30,6 @@ from tqdm import tqdm
 
 from olmocr.check import (
     check_poppler_version,
-    check_sglang_version,
-    check_torch_gpu_available,
 )
 from olmocr.data.renderpdf import render_pdf_to_base64png
 from olmocr.filter.filter import Language, PdfFilter
@@ -90,7 +88,7 @@ SGLANG_SERVER_URL = ''
 ERROR_PROCESING_FILES_LOG_FILE = "olmocr_error_processing_files"
 
 # Page delimiter, to concatenate the pages together.
-PAGE_DELIMITER = "\n\n-------------- page --------------\n\n"
+PAGE_DELIMITER = "-------------- page --------------"
 
 # Global timestamp for logging
 global_timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -785,7 +783,7 @@ async def main():
         help="List of paths where you can find the model to convert this pdf. You can specify several different paths here, and the script will try to use the one which is fastest to access",
         default="allenai/olmOCR-7B-0225-preview",
     )
-    parser.add_argument("--model_max_context", type=int, default="8192", help="Maximum context length that the model was fine tuned under")
+    parser.add_argument("--model_max_context", type=int, default="32000", help="Maximum context length that the model was fine tuned under")
     parser.add_argument("--model_chat_template", type=str, default="qwen2-vl", help="Chat template to pass to sglang server")
     parser.add_argument("--target_longest_image_dim", type=int, help="Dimension on longest side to use for rendering the pdf pages", default=1024)
     parser.add_argument("--target_anchor_text_len", type=int, help="Maximum amount of anchor text to use (characters)", default=6000)
@@ -899,9 +897,6 @@ async def main():
     if args.stats:
         print_stats(args)
         return
-
-    check_sglang_version()
-    check_torch_gpu_available()
 
     logger.info(f"Starting pipeline with PID {os.getpid()}")
 
