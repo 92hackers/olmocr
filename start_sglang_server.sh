@@ -5,6 +5,14 @@
 
 # Server arguments ref: https://docs.sglang.ai/backend/server_arguments.html
 
+set -ex
+
+# Make sure numpy version installed correctly.
+# Otherwise, you should DELETE numpy related dirs in `site-packages` and reinstall.
+python -c 'from transformers.generation.utils import *'
+python -c 'import transformers.models.clip.modeling_clip'
+python -c 'from numpy.lib.function_base import *'
+
 model=/home/viseem/.cache/modelscope/hub/models/allenai/olmOCR-7B-0225-preview
 
 SGLANG_SERVER_PORT=30024
