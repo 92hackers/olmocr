@@ -11,7 +11,7 @@ SGLANG_SERVER_PORT=30024
 
 sglang_server_url=http://$SGLANG_SERVER_HOST:$SGLANG_SERVER_PORT
 
-pdf_files=/home/cy/projects/large-language-model/open-webui/backend/extract_errors_pdf_filepaths_20250510_225826.log
+pdf_files=/home/cy/Downloads/doehler_resumes/internal/pdfs/*.pdf
 
 # Make sure the dependencies are correctly installed
 #bash ./check_deps.sh

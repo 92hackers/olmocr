@@ -88,7 +88,7 @@ SGLANG_SERVER_URL = ''
 ERROR_PROCESING_FILES_LOG_FILE = "olmocr_error_processing_files"
 
 # Page delimiter, to concatenate the pages together.
-PAGE_DELIMITER = "-------------- page --------------"
+PAGE_DELIMITER = "\n-\n"
 
 # Global timestamp for logging
 global_timestamp = time.strftime("%Y%m%d_%H%M%S")
