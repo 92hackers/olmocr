@@ -12,7 +12,7 @@ import asyncio
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 
-from olmocr.pipeline import main as pipeline_main
+from olmocr.pipeline_api import main as pipeline_main
 
 app = FastAPI(title="Olmocr Pipeline Server")
 
@@ -44,11 +44,10 @@ async def handle_ocr_pipeline(file: UploadFile = File(...)):
     txt_save_path = f"/tmp/{file_sha1}_{filename}.txt"
     print(f"save_path: {save_path}")
 
-    if os.path.exists(save_path):
-        os.remove(save_path)
-
-    with open(save_path, "ab") as f:
-        f.write(content)
+    # Save the file to the temporary directory if it doesn't exist
+    if not os.path.exists(save_path):
+        with open(save_path, "wb") as f:
+            f.write(content)
 
     # Run the OCR pipeline
     sys.argv = [

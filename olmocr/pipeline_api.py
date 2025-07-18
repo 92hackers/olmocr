@@ -5,7 +5,6 @@ import datetime
 import hashlib
 import json
 import logging
-import multiprocessing
 import os
 import random
 import re
@@ -14,7 +13,7 @@ import sys
 import tempfile
 import time
 
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from functools import cache, partial
@@ -75,9 +74,6 @@ pdf_s3 = boto3.client("s3")
 metrics = MetricsKeeper(window=60 * 5)
 tracker = WorkerTracker()
 
-# Process pool for offloading cpu bound work, like calculating anchor texts, max 32 workers, otherwise it can spawn way too many workers on a big machine
-process_pool = ProcessPoolExecutor(max_workers=min(multiprocessing.cpu_count() // 2 + 1, 32), mp_context=multiprocessing.get_context("spawn"))
-
 # Filter object, cached so it will only get loaded when/if you need it
 get_pdf_filter = cache(lambda: PdfFilter(languages_to_keep={Language.ENGLISH, None}, apply_download_spam_check=True, apply_form_check=True))
 
@@ -131,13 +127,7 @@ async def build_page_query(local_pdf_path: str, page: int, target_longest_image_
 
     # Allow the page rendering to process in the background while we get the anchor text (which blocks the main thread)
     image_base64 = asyncio.to_thread(render_pdf_to_base64png, local_pdf_path, page, target_longest_image_dim=target_longest_image_dim)
-
-    # GET ANCHOR TEXT IS NOT THREAD SAFE!! Ahhhh..... don't try to do it
-    # and it's also CPU bound, so it needs to run in a process pool
-    loop = asyncio.get_running_loop()
-    anchor_text = loop.run_in_executor(
-        process_pool, partial(get_anchor_text, pdf_engine="pdfreport", target_length=target_anchor_text_len), local_pdf_path, page
-    )
+    anchor_text = asyncio.to_thread(get_anchor_text, local_pdf_path, page, pdf_engine="pdfreport", target_length=target_anchor_text_len)
 
     image_base64, anchor_text = await asyncio.gather(image_base64, anchor_text)  # type: ignore
     if image_rotation != 0:
@@ -927,9 +917,6 @@ async def main():
     # Wait for all worker tasks to finish
     await asyncio.gather(*worker_tasks)
 
-    # Wait for server to stop
-    process_pool.shutdown(wait=False)
-
     global error_processing_files_counter
 
     metrics_task.cancel()
@@ -940,7 +927,3 @@ async def main():
     logger.info(f"Total time taken: {elapsed_time / 60:.2f} minutes")
     logger.info(f"Total documents processed: {len(pdf_work_paths):,}")
     logger.info(f"Total error-processing documents count: {error_processing_files_counter}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
