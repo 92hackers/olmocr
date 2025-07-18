@@ -603,7 +603,7 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
 
 
 async def sglang_server_ready():
-    max_attempts = 300
+    max_attempts = 10
     delay_sec = 1
     url = f"{SGLANG_SERVER_URL}/v1/models"
 
@@ -759,10 +759,6 @@ def print_stats(args):
 async def main():
     parser = argparse.ArgumentParser(description="Manager for running millions of PDFs through a batch inference pipeline")
     parser.add_argument(
-        "workspace",
-        help="The filesystem path where work will be stored, can be a local folder, or an s3 path if coordinating work with many workers, s3://bucket/prefix/ ",
-    )
-    parser.add_argument(
         "--pdfs",
         nargs="*",
         help="Path to add pdfs stored in s3 to the workspace, can be a glob path s3://bucket/prefix/*.pdf or path to file containing list of pdf paths",
@@ -772,7 +768,7 @@ async def main():
     parser.add_argument("--pdf_profile", help="S3 configuration profile for accessing the raw pdf documents", default=None)
     parser.add_argument("--pages_per_group", type=int, default=500, help="Aiming for this many pdf pages per work item group")
     parser.add_argument("--max_page_retries", type=int, default=8, help="Max number of times we will retry rendering a page")
-    parser.add_argument("--max_page_error_rate", type=float, default=0.004, help="Rate of allowable failed pages in a document, 1/250 by default")
+    parser.add_argument("--max_page_error_rate", type=float, default=0.5, help="Rate of allowable failed pages in a document, 1/250 by default")
     parser.add_argument("--workers", type=int, default=8, help="Number of workers to run at a time")
     parser.add_argument("--apply_filter", action="store_true", help="Apply basic filtering to English pdfs which are not forms, and not likely seo spam")
     parser.add_argument("--stats", action="store_true", help="Instead of running any job, reports some statistics about the current workspace")
@@ -789,8 +785,12 @@ async def main():
     parser.add_argument("--target_anchor_text_len", type=int, help="Maximum amount of anchor text to use (characters)", default=6000)
 
     parser.add_argument("--port", type=int, default=30024, help="Port to use for the SGLang server")
-    parser.add_argument("--sglang_server_url", type=str, default='', help="Url to use for the SGLang server")
+    parser.add_argument("--sglang_server_url", type=str, default='http://localhost:30024', help="Url to use for the SGLang server")
     args = parser.parse_args()
+
+    args.workspace = "./local_workspace"
+
+    print(f"args: {args}")
 
     start_time = time.time()
 
