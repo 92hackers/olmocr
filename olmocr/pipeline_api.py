@@ -624,128 +624,6 @@ async def metrics_reporter(work_queue):
         await asyncio.sleep(10)
 
 
-
-def print_stats(args):
-    LONG_CONTEXT_THRESHOLD = 32768
-
-    assert args.workspace.startswith("s3://"), "Printing stats functionality only works with s3 workspaces for now."
-
-    # Get total work items and completed items
-    index_file_s3_path = os.path.join(args.workspace, "work_index_list.csv.zstd")
-    output_glob = os.path.join(args.workspace, "results", "*.jsonl")
-
-    done_work_items = expand_s3_glob(workspace_s3, output_glob)
-    work_queue = {parts[0]: parts[1:] for line in download_zstd_csv(workspace_s3, index_file_s3_path) if (parts := line.strip().split(",")) and line.strip()}
-
-    total_items = len(work_queue)
-    completed_items = len(done_work_items)
-
-    def process_output_file(s3_path):
-        try:
-            data = get_s3_bytes(workspace_s3, s3_path)
-            doc_count = 0
-            total_input_tokens = 0
-            total_output_tokens = 0
-            total_pages = 0
-            total_fallback_pages = 0
-            processed_paths = set()
-
-            # Counters for long context docs within a single file
-            long_context_docs = 0
-            long_context_tokens = 0
-
-            for line in data.decode("utf-8").splitlines():
-                if line.strip():
-                    doc = json.loads(line)
-                    doc_count += 1
-                    doc_input_tokens = doc["metadata"].get("total-input-tokens", 0)
-                    doc_output_tokens = doc["metadata"].get("total-output-tokens", 0)
-                    doc_pages = doc["metadata"].get("pdf-total-pages", 0)
-                    doc_fallback_pages = doc["metadata"].get("total-fallback-pages", 0)
-
-                    total_input_tokens += doc_input_tokens
-                    total_output_tokens += doc_output_tokens
-                    total_pages += doc_pages
-                    total_fallback_pages += doc_fallback_pages
-                    processed_paths.add(doc["metadata"]["Source-File"])
-
-                    # Check if this doc exceeds the long context threshold
-                    if doc_output_tokens > LONG_CONTEXT_THRESHOLD:
-                        long_context_docs += 1
-                        long_context_tokens += doc_output_tokens
-
-            return (
-                doc_count,
-                total_input_tokens,
-                total_output_tokens,
-                total_pages,
-                total_fallback_pages,
-                processed_paths,
-                long_context_docs,
-                long_context_tokens,
-            )
-        except Exception as e:
-            logger.warning(f"Error processing {s3_path}: {e}")
-            return 0, 0, 0, 0, 0, set(), 0, 0
-
-    print("\nProcessing output files...")
-    docs_total = 0
-    input_tokens_total = 0
-    output_tokens_total = 0
-    pages_total = 0
-    fallback_pages_total = 0
-    all_processed_paths = set()
-    original_paths = set()
-
-    # Counters for long context documents across all files
-    long_context_docs_count = 0
-    long_context_tokens_total = 0
-
-    # First collect all original PDF paths
-    for done_work_item in done_work_items:
-        if match := re.search(r"output_(\w+).jsonl", done_work_item):
-            done_work_hash = match.group(1)
-            original_paths.update(work_queue[done_work_hash])
-
-    with ThreadPoolExecutor() as executor:
-        futures = {executor.submit(process_output_file, item): item for item in done_work_items}
-
-        for future in tqdm(as_completed(futures), total=len(futures)):
-            (doc_count, input_tokens, output_tokens, pages, fallback_pages, processed_paths, long_context_docs, long_context_tokens) = future.result()
-            docs_total += doc_count
-            input_tokens_total += input_tokens
-            output_tokens_total += output_tokens
-            pages_total += pages
-            fallback_pages_total += fallback_pages
-            all_processed_paths.update(processed_paths)
-            long_context_docs_count += long_context_docs
-            long_context_tokens_total += long_context_tokens
-
-    skipped_paths = original_paths - all_processed_paths
-
-    print("\nWork Items Status:")
-    print(f"Total work items: {total_items:,}")
-    print(f"Completed items: {completed_items:,}")
-    print(f"Remaining items: {total_items - completed_items:,}")
-
-    print("\nResults:")
-    print(f"Total documents processed: {docs_total:,}")
-    print(f"Total documents skipped: {len(skipped_paths):,}")
-    print(f"Total pages on fallback: {fallback_pages_total:,}")
-    print(f"Total pages processed: {pages_total:,}")
-
-    print(f"\nTotal output tokens: {output_tokens_total:,}")
-    print(f"Projected output tokens: {round((output_tokens_total/max(1, completed_items))*total_items):,}")
-
-    print(f"\nAverage pages per doc: {pages_total/max(1,docs_total):,.1f}")
-    print(f"Average output tokens per doc: {output_tokens_total/max(1,docs_total):,.1f}")
-    print(f"Average output tokens per page: {output_tokens_total/max(1,pages_total):,.1f}")
-
-    # Print long context documents stats
-    print(f"\nLong Context Documents (>{LONG_CONTEXT_THRESHOLD} tokens): {long_context_docs_count:,}")
-    print(f"Total tokens in long context documents: {long_context_tokens_total:,}")
-
-
 async def main():
     parser = argparse.ArgumentParser(description="Manager for running millions of PDFs through a batch inference pipeline")
     parser.add_argument(
@@ -758,8 +636,8 @@ async def main():
     parser.add_argument("--pdf_profile", help="S3 configuration profile for accessing the raw pdf documents", default=None)
     parser.add_argument("--pages_per_group", type=int, default=500, help="Aiming for this many pdf pages per work item group")
     parser.add_argument("--max_page_retries", type=int, default=8, help="Max number of times we will retry rendering a page")
-    parser.add_argument("--max_page_error_rate", type=float, default=0.5, help="Rate of allowable failed pages in a document, 1/250 by default")
-    parser.add_argument("--workers", type=int, default=8, help="Number of workers to run at a time")
+    parser.add_argument("--max_page_error_rate", type=float, default=0.004, help="Rate of allowable failed pages in a document, 1/250 by default")
+    parser.add_argument("--workers", type=int, default=1, help="Number of workers to run at a time")
     parser.add_argument("--apply_filter", action="store_true", help="Apply basic filtering to English pdfs which are not forms, and not likely seo spam")
     parser.add_argument("--stats", action="store_true", help="Instead of running any job, reports some statistics about the current workspace")
 
@@ -887,10 +765,6 @@ async def main():
 
         # Now call populate_queue
         await work_queue.populate_queue(list(pdf_work_paths), items_per_group)
-
-    if args.stats:
-        print_stats(args)
-        return
 
     logger.info(f"Starting pipeline with PID {os.getpid()}")
 
