@@ -7,7 +7,6 @@
 import os
 import sys
 import hashlib
-import asyncio
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
@@ -51,7 +50,7 @@ async def handle_ocr_pipeline(file: UploadFile = File(...)):
 
     # Run the OCR pipeline
     sys.argv = [
-        "olmocr.pipeline",
+        "olmocr.pipeline_api",
         "--sglang_server_url", SGLANG_SERVER_URL,
         "--pdfs", save_path,
         "--workers", "1",

@@ -6,7 +6,7 @@ import sys
 file_path = '/home/cy/Downloads/doehler_resumes/internal/pdfs/DS0499_Simon Zhu_202411.pdf'
 
 # 2. 构造 multipart/form-data 请求
-url = "http://127.0.0.1:8000/ocr"
+url = "http://127.0.0.1:18000/ocr"
 
 with open(file_path, "rb") as f:
     files = {"file": (file_path, f)}
