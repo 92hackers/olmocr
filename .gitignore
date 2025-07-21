@@ -15,7 +15,6 @@ math_data/*
 math_data_big/*
 gpt4otestset/*
 gpt4otestset_output/*
-pdfs/*
 olmOCR-bench/*
 table_data*/
 /synth*/
