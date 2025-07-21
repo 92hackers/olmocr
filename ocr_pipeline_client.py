@@ -3,7 +3,7 @@ import requests
 import sys
 
 # 1. 要上传的文件路径
-file_path = '/home/cy/Downloads/doehler_resumes/internal/pdfs/DS0499_Simon Zhu_202411.pdf'
+file_path = './pdfs/DS0499_Simon Zhu_202411.pdf'
 
 # 2. 构造 multipart/form-data 请求
 url = "http://127.0.0.1:18000/ocr"
