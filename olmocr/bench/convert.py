@@ -223,6 +223,7 @@ if __name__ == "__main__":
     available_methods = {
         "olmocr_pipeline": ("olmocr.bench.runners.run_olmocr_pipeline", "run_olmocr_pipeline"),
         "gotocr": ("olmocr.bench.runners.run_gotocr", "run_gotocr"),
+        "nanonetsocr": ("olmocr.bench.runners.run_nanonetsocr", "run_nanonetsocr"),
         "marker": ("olmocr.bench.runners.run_marker", "run_marker"),
         "mineru": ("olmocr.bench.runners.run_mineru", "run_mineru"),
         "chatgpt": ("olmocr.bench.runners.run_chatgpt", "run_chatgpt"),

@@ -3,7 +3,10 @@ from typing import Literal
 
 import httpx
 
-from olmocr.bench.prompts import build_basic_prompt
+from olmocr.bench.prompts import (
+    build_basic_prompt,
+    build_openai_silver_data_prompt_no_document_anchoring,
+)
 from olmocr.data.renderpdf import render_pdf_to_base64png
 from olmocr.prompts.anchor import get_anchor_text
 from olmocr.prompts.prompts import (
@@ -20,7 +23,7 @@ async def run_server(
     model: str = "allenai/olmOCR-7B-0225-preview",
     temperature: float = 0.1,
     target_longest_image_dim: int = 1024,
-    prompt_template: Literal["full", "basic", "finetune"] = "finetune",
+    prompt_template: Literal["full", "full_no_document_anchoring", "basic", "finetune"] = "finetune",
     response_template: Literal["plain", "json"] = "json",
 ) -> str:
     """
@@ -41,6 +44,8 @@ async def run_server(
 
     if prompt_template == "full":
         prompt = build_openai_silver_data_prompt(anchor_text)
+    elif prompt_template == "full_no_document_anchoring":
+        prompt = build_openai_silver_data_prompt_no_document_anchoring(anchor_text)
     elif prompt_template == "finetune":
         prompt = build_finetuning_prompt(anchor_text)
     elif prompt_template == "basic":

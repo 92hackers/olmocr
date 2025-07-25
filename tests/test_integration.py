@@ -19,7 +19,7 @@ class TestPipelineIntegration(unittest.TestCase):
                         print(self.data[-1])
 
     def test_edgar(self) -> None:
-        self.assertTrue(any("King of England" in line["text"] for line in self.data))
+        self.assertTrue(any("King of the English" in line["text"] for line in self.data))
 
     def test_ambig(self) -> None:
         self.assertTrue(any("Apples and Bananas" in line["text"] for line in self.data))

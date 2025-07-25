@@ -47,6 +47,21 @@ class TestNormalizeText(unittest.TestCase):
         """Test that empty input returns empty output"""
         self.assertEqual(normalize_text(""), "")
 
+    def test_brs(self):
+        """Test that empty input returns empty output"""
+        self.assertEqual(normalize_text("Hello<br>everyone"), "Hello everyone")
+        self.assertEqual(normalize_text("Hello<br>everyone"), normalize_text("Hello\neveryone"))
+        self.assertEqual(normalize_text("Hello<br/>everyone"), "Hello everyone")
+        self.assertEqual(normalize_text("Hello<br/>everyone"), normalize_text("Hello\neveryone"))
+
+    def test_two_stars(self):
+        self.assertEqual(
+            normalize_text(
+                "**Georges V.** (2007) – *Le Forez du VIe au IVe millénaire av. J.-C. Territoires, identités et stratégies des sociétés humaines du Massif central dans le bassin amont de la Loire (France)*, thèse de doctorat, université de Bourgogne, Dijon, 2 vol., 435 p."
+            ),
+            "Georges V. (2007) - Le Forez du VIe au IVe millénaire av. J.-C. Territoires, identités et stratégies des sociétés humaines du Massif central dans le bassin amont de la Loire (France), thèse de doctorat, université de Bourgogne, Dijon, 2 vol., 435 p.",
+        )
+
 
 class TestBasePDFTest(unittest.TestCase):
     """Test the BasePDFTest class"""

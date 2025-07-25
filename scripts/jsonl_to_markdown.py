@@ -46,7 +46,6 @@ def jsonl_to_markdown(input_file, output_dir):
 # It takes two arguments: the input JSONL file and the output directory.
 # The script will create the output directory if it does not exist.
 if __name__ == "__main__":
-
     if len(sys.argv) != 3:
         print("Usage: python jsonl_to_markdown.py <input_file> <output_dir>")
         sys.exit(1)

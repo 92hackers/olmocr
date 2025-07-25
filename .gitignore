@@ -14,11 +14,13 @@ localworkspace/*
 math_data/*
 math_data_big/*
 gpt4otestset/*
+old_train/
 gpt4otestset_output/*
 olmOCR-bench/*
 table_data*/
 /synth*/
 dolma_samples/*
+old_train/
 /*.html
 scoreelo.csv
 debug.log

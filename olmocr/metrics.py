@@ -72,6 +72,34 @@ class MetricsKeeper:
 
         return "\n".join(lines)
 
+    def get_total_metrics(self):
+        """
+        Returns the total cumulative metrics since the MetricsKeeper was created.
+
+        Returns:
+            dict: Dictionary of metric names to their total values.
+        """
+        return dict(self.total_metrics)
+
+    def get_metrics_summary(self):
+        """
+        Returns a summary of metrics including totals and rates.
+
+        Returns:
+            dict: Dictionary containing total metrics and overall rates.
+        """
+        current_time = time.time()
+        elapsed_time = current_time - self.start_time
+
+        summary = {"elapsed_time_seconds": elapsed_time, "total_metrics": dict(self.total_metrics), "rates": {}}
+
+        # Calculate rates for each metric
+        if elapsed_time > 0:
+            for key, value in self.total_metrics.items():
+                summary["rates"][f"{key}_per_sec"] = value / elapsed_time
+
+        return summary
+
 
 class WorkerTracker:
     def __init__(self):
@@ -145,3 +173,28 @@ class WorkerTracker:
         Use 'await get_status_table()' to retrieve the status table.
         """
         raise NotImplementedError("Use 'await get_status_table()' to get the status table.")
+
+
+async def cpu_vs_wall(interval: float = 1.0):
+    """
+    Periodically print the percentage of wall-clock time that was
+    consumed as CPU time since the previous sample.
+    """
+    last_wall = time.perf_counter()
+    last_cpu = time.process_time()
+
+    while True:
+        await asyncio.sleep(interval)
+
+        # elapsed times
+        wall_now = time.perf_counter()
+        cpu_now = time.process_time()
+
+        wall_delta = wall_now - last_wall
+        cpu_delta = cpu_now - last_cpu
+
+        last_wall, last_cpu = wall_now, cpu_now
+
+        # On a single core, 100 % means fully CPU-bound.
+        pct = 100.0 * cpu_delta / wall_delta if wall_delta else 0.0
+        print(f"CPU load (over {interval:.1f}s): {pct:5.1f} %")

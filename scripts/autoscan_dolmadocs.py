@@ -153,8 +153,8 @@ def list_result_files(s3_client, workspace_path):
         if "Contents" in page:
             all_files.extend([f"s3://{bucket}/{obj['Key']}" for obj in page["Contents"] if obj["Key"].endswith(".jsonl") or obj["Key"].endswith(".json")])
 
-        if len(all_files) > 1000:
-            break
+        # if len(all_files) > 1000:
+        #     break
 
     return all_files
 

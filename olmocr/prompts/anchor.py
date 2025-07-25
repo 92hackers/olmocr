@@ -5,6 +5,7 @@ import random
 import re
 import subprocess
 from dataclasses import dataclass
+from os import PathLike
 from typing import List, Literal
 
 import ftfy
@@ -16,7 +17,7 @@ from olmocr.filter.coherency import get_document_coherency
 
 
 def get_anchor_text(
-    local_pdf_path: str, page: int, pdf_engine: Literal["pdftotext", "pdfium", "pypdf", "topcoherency", "pdfreport"], target_length: int = 4000
+    local_pdf_path: str | PathLike, page: int, pdf_engine: Literal["pdftotext", "pdfium", "pypdf", "topcoherency", "pdfreport"], target_length: int = 4000
 ) -> str:
     assert page > 0, "Pages are 1-indexed in pdf-land"
 
@@ -254,7 +255,11 @@ def _linearize_pdf_report(report: PageReport, max_length: int = 4000) -> str:
     result = ""
     result += f"Page dimensions: {report.mediabox.x1:.1f}x{report.mediabox.y1:.1f}\n"
 
-    if max_length < 20:
+    if max_length == -1:
+        # Return a basic anchor just saying the whole page is an image
+        result += f"[Image 0x0 to {report.mediabox.x1:.0f}x{report.mediabox.y1:.0f}]\n"
+        return result
+    elif max_length < 20:
         return result
 
     images = _merge_image_elements(report.image_elements)

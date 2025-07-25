@@ -1,165 +1,859 @@
-import glob
+import base64
+import json
 import logging
-import os
 import re
-from typing import Optional
+from abc import ABC, abstractmethod
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass, fields
+from functools import reduce
+from io import BytesIO
+from os import PathLike
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeAlias
 
-import boto3
-from datasets import Dataset, load_dataset
-from filelock import FileLock
+import numpy as np
+import yaml
+from PIL import Image
+from pypdf import PdfReader
+from torch.utils.data import Dataset
+from tqdm import tqdm
 
-from olmocr.data.renderpdf import get_pdf_media_box_width_height
+from olmocr.data.renderpdf import render_pdf_to_base64png
 from olmocr.prompts.anchor import get_anchor_text
-from olmocr.s3_utils import parse_custom_id, parse_s3_path
+from olmocr.prompts.prompts import PageResponse, build_finetuning_prompt
+
+# Type alias for samples
+Sample: TypeAlias = Dict[str, Any]
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Quiet logs from pypdf and smart open
-logging.getLogger("pypdf").setLevel(logging.ERROR)
-logging.getLogger("smart_open").setLevel(logging.ERROR)
 
+def validate_pdf_pair(md_path: Path) -> Tuple[Optional[Dict[str, Path]], Optional[Tuple[Path, str]]]:
+    """Validate a single markdown-PDF pair.
 
-def list_dataset_files(s3_glob_path: str):
+    Args:
+        md_path: Path to the markdown file
+
+    Returns:
+        Tuple of (valid_sample, invalid_pdf_info)
+        - valid_sample: Dict with markdown_path and pdf_path if valid, None otherwise
+        - invalid_pdf_info: Tuple of (pdf_path, reason) if invalid, None otherwise
     """
-    Lists files in the specified S3 path that match the glob pattern.
-    """
-    if s3_glob_path.startswith("s3://"):
-        s3 = boto3.client("s3")
-        match = re.match(r"s3://([^/]+)/(.+)", s3_glob_path)
-        if not match:
-            logger.error(f"Invalid S3 path: {s3_glob_path}")
-            raise ValueError(f"Invalid S3 path: {s3_glob_path}")
+    # Look for PDF with same stem (filename without extension)
+    pdf_path = md_path.with_suffix(".pdf")
 
-        bucket, prefix_pattern = match.groups()
-        prefix = prefix_pattern.split("*")[0]  # Extract prefix before the wildcard
-        paginator = s3.get_paginator("list_objects_v2")
-        pages = paginator.paginate(Bucket=bucket, Prefix=prefix)
+    if pdf_path.exists() or pdf_path.is_symlink():
+        # Resolve symlink if it is one
+        if pdf_path.is_symlink():
+            pdf_path = pdf_path.resolve()
 
-        files = []
-        pattern = re.compile(prefix_pattern.replace("*", ".*"))
-        for page in pages:
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                if pattern.fullmatch(key):
-                    files.append(f"s3://{bucket}/{key}")
-        return files
-    else:
-        return glob.glob(s3_glob_path)
+        # Verify the resolved path exists
+        if pdf_path.exists():
+            # Validate PDF - check it loads and has exactly one page and that you can get document-anchoring from it
+            try:
+                reader = PdfReader(str(pdf_path))
+                num_pages = len(reader.pages)
+
+                if num_pages != 1:
+                    return None, (pdf_path, f"Expected 1 page, found {num_pages}")
+
+                # Test that document anchoring works
+                from olmocr.prompts.anchor import get_anchor_text
+
+                get_anchor_text(pdf_path, page=1, pdf_engine="pdfreport", target_length=100)
+
+                return {"markdown_path": md_path, "pdf_path": pdf_path}, None
+
+            except Exception as e:
+                return None, (pdf_path, f"Failed to load: {str(e)}")
+
+    return None, None
 
 
-def load_jsonl_into_ds(s3_glob_path: str, first_n_files: Optional[int] = None) -> Dataset:
-    """
-    Loads JSONL files from the specified S3 path into a Hugging Face Dataset.
-    """
-    all_json_files = list_dataset_files(s3_glob_path)
+@dataclass(frozen=True, slots=True)
+class PipelineStep(ABC):
+    """Abstract base class for pipeline steps."""
 
-    if first_n_files:
-        all_json_files = all_json_files[:first_n_files]
+    @abstractmethod
+    def __call__(self, sample: Sample) -> Sample:
+        """Process a sample and return the modified sample."""
+        ...
 
-    # Use datasets library to load JSON files from S3
-    dataset = load_dataset(
-        "json",
-        data_files=all_json_files,
+
+class BaseMarkdownPDFDataset(Dataset):
+    """Base dataset class that loads and verifies markdown-PDF pairs."""
+
+    def __init__(self, root_dir: str | PathLike, pipeline_steps: Optional[List[PipelineStep]] = None):
+        """
+        Initialize the dataset by finding all markdown files with corresponding PDFs.
+
+        Args:
+            root_dir: Path to the root folder containing processed markdown and PDF files
+            pipeline_steps: Optional list of pipeline steps to apply to each sample
+        """
+        self.root_dir = Path(root_dir)
+        self.pipeline_steps = pipeline_steps or []
+        self.samples = []
+
+        # Find all markdown files recursively
+        logger.info(f"Scanning for markdown files in {self.root_dir}...")
+        md_files = list(self.root_dir.rglob("*.md"))
+
+        # Verify each markdown file has a corresponding PDF using ProcessPoolExecutor
+        valid_count = 0
+        invalid_pdfs = []
+
+        logger.info(f"Validating {len(md_files)} markdown-PDF pairs using ProcessPoolExecutor...")
+
+        # Use ProcessPoolExecutor for parallel validation
+        with ProcessPoolExecutor(max_workers=8) as executor:
+            # Submit all validation tasks
+            future_to_md = {executor.submit(validate_pdf_pair, md_path): md_path for md_path in md_files}
+
+            # Process results as they complete
+            with tqdm(total=len(md_files), desc="Validating PDFs") as pbar:
+                for future in as_completed(future_to_md):
+                    md_path = future_to_md[future]
+                    try:
+                        valid_sample, invalid_pdf_info = future.result()
+
+                        if valid_sample:
+                            self.samples.append(valid_sample)
+                            valid_count += 1
+                        elif invalid_pdf_info:
+                            invalid_pdfs.append(invalid_pdf_info)
+
+                    except Exception as e:
+                        logger.error(f"Error processing {md_path}: {str(e)}")
+                        invalid_pdfs.append((md_path.with_suffix(".pdf"), f"Processing error: {str(e)}"))
+
+                    pbar.update(1)
+
+        logger.info(f"Found {valid_count} valid markdown-PDF pairs")
+
+        if invalid_pdfs:
+            logger.warning(f"{len(invalid_pdfs)} invalid PDFs found:")
+            for pdf_path, reason in invalid_pdfs[:5]:  # Show first 5
+                logger.warning(f"  - {pdf_path.name}: {reason}")
+            if len(invalid_pdfs) > 5:
+                logger.warning(f"  ... and {len(invalid_pdfs) - 5} more")
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """
+        Get a single sample from the dataset.
+
+        Returns:
+            dict containing at minimum:
+                - 'markdown_path': Path to the markdown file
+                - 'pdf_path': Path to the PDF file
+
+            Additional fields will be added by pipeline steps.
+        """
+        # Start with basic sample info
+        sample = self.samples[idx].copy()
+
+        # Apply pipeline steps using reduce
+        return reduce(lambda s, f: f(s), self.pipeline_steps, sample)
+
+
+@dataclass(frozen=True, slots=True)
+class FrontMatterParser(PipelineStep):
+    """Pipeline step that parses YAML front matter from markdown content."""
+
+    front_matter_class: Optional[Type] = None
+
+    def _extract_front_matter_and_text(self, markdown_content: str) -> tuple[Dict[str, Any], str]:
+        """Extract YAML front matter and text from markdown content."""
+        if markdown_content.startswith("---\n"):
+            try:
+                # Find the closing --- delimiter
+                end_index = markdown_content.find("\n---\n", 4)
+                if end_index != -1:
+                    front_matter_str = markdown_content[4:end_index]
+                    text = markdown_content[end_index + 5 :].strip()
+
+                    # Parse YAML
+                    front_matter = yaml.safe_load(front_matter_str) or {}
+                    return front_matter, text
+            except yaml.YAMLError as e:
+                logger.warning(f"Failed to parse YAML front matter: {e}")
+
+        return {}, markdown_content.strip()
+
+    def _parse_front_matter(self, front_matter_dict: Dict[str, Any], text: str) -> Any:
+        """Parse front matter dictionary into dataclass instance if front_matter_class is specified."""
+        if not self.front_matter_class:
+            return front_matter_dict
+
+        # Get field names and types from the dataclass
+        field_info = {f.name: f.type for f in fields(self.front_matter_class)}
+
+        # Validate and convert values
+        kwargs = {}
+        for field_name, field_type in field_info.items():
+            # Special handling for natural_text field in PageResponse
+            if field_name == "natural_text" and self.front_matter_class == PageResponse:
+                kwargs[field_name] = text if text else None
+                continue
+
+            if field_name not in front_matter_dict:
+                raise ValueError(f"Missing required field '{field_name}' in front matter")
+
+            value = front_matter_dict[field_name]
+
+            # Handle type conversions
+            if field_type is int and isinstance(value, str):
+                kwargs[field_name] = int(value)
+            elif field_type is bool and isinstance(value, str):
+                kwargs[field_name] = value.lower() == "true"
+            elif field_type is Optional[str]:
+                kwargs[field_name] = value if value else None
+            else:
+                kwargs[field_name] = value
+
+        # Check for extra fields (excluding natural_text if it's PageResponse)
+        expected_fields = set(field_info.keys())
+        if self.front_matter_class == PageResponse:
+            expected_fields.discard("natural_text")
+        extra_fields = set(front_matter_dict.keys()) - expected_fields
+        if extra_fields:
+            raise ValueError(f"Unexpected fields in front matter: {extra_fields}")
+
+        return self.front_matter_class(**kwargs)
+
+    def __call__(self, sample: Sample) -> Sample:
+        """Parse front matter from markdown content."""
+        # Read markdown content if not already loaded
+        if "markdown_content" not in sample:
+            sample["markdown_content"] = sample["markdown_path"].read_text(encoding="utf-8")
+
+        # Extract and parse front matter
+        front_matter, text = self._extract_front_matter_and_text(sample["markdown_content"])
+
+        # Parse front matter to dataclass if specified
+        try:
+            page_data = self._parse_front_matter(front_matter, text)
+        except Exception as e:
+            raise ValueError(f"Error parsing front matter for {sample['markdown_path']}: {e}")
+
+        # Only add page_data field
+        sample["page_data"] = page_data
+
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class PDFRenderer(PipelineStep):
+    """Pipeline step that renders PDF to image."""
+
+    target_longest_image_dim: int
+    image_transform: Optional[Callable] = None
+
+    def __call__(self, sample: Sample) -> Sample:
+        """Render PDF to image."""
+        # Render PDF to image
+        base64_png = render_pdf_to_base64png(str(sample["pdf_path"]), page_num=1, target_longest_image_dim=self.target_longest_image_dim)
+        png_bytes = base64.b64decode(base64_png)
+        image = Image.open(BytesIO(png_bytes))
+
+        # Apply transform if provided
+        if self.image_transform:
+            image = self.image_transform(image)
+
+        # Update sample
+        sample["image"] = image
+
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class StaticLengthDocumentAnchoring(PipelineStep):
+    target_anchor_text_len: int
+
+    """Pipeline step that runs document anchoring on the PDF and puts in the data to be used by later prompting stages"""
+
+    def __call__(self, sample: Sample) -> Sample:
+        anchor_text = get_anchor_text(sample["pdf_path"], page=1, pdf_engine="pdfreport", target_length=self.target_anchor_text_len)
+        sample["anchor_text"] = anchor_text
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class FinetuningPrompt(PipelineStep):
+    """Applies the standard fine tuning prompt"""
+
+    def __call__(self, sample: Sample) -> Sample:
+        sample["instruction_prompt"] = build_finetuning_prompt(sample["anchor_text"])
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class NewYamlFinetuningPromptWithAnchoring(PipelineStep):
+    """Applies the standard fine tuning prompt"""
+
+    def __call__(self, sample: Sample) -> Sample:
+        sample["instruction_prompt"] = (
+            f"Attached is one page of a document, as well as some raw textual content that was previously extracted for it. "
+            f"Just return the plain text representation of this document as if you were reading it naturally. Convert equations to LateX and tables to markdown.\n"
+            f"RAW_TEXT_START\n{sample['anchor_text']}\nRAW_TEXT_END\n"
+            f"Return your output as markdown, with a front matter section on top specifying values for the primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters."
+        )
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class NewYamlFinetuningPromptWithNoAnchoring(PipelineStep):
+    """Applies the standard fine tuning prompt"""
+
+    def __call__(self, sample: Sample) -> Sample:
+        sample["instruction_prompt"] = (
+            f"Attached is one page of a document that you must process. "
+            f"Just return the plain text representation of this document as if you were reading it naturally. Convert equations to LateX and tables to markdown.\n"
+            f"Return your output as markdown, with a front matter section on top specifying values for the primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters."
+        )
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class FrontMatterOutputFormat(PipelineStep):
+    """Takes the output and applies the standard yaml formatting to it"""
+
+    def __call__(self, sample: Sample) -> Sample:
+        page_data = sample["page_data"]
+        assert type(page_data) is PageResponse
+
+        sample["response"] = (
+            f"""---
+primary_language: {page_data.primary_language}
+is_rotation_valid: {page_data.is_rotation_valid}
+rotation_correction: {page_data.rotation_correction}
+is_table: {page_data.is_table}
+is_diagram: {page_data.is_diagram}
+---
+{page_data.natural_text}
+""".strip()
+        )
+
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class JSONOutputFormat(PipelineStep):
+    """Takes the output and applies the standard yaml formatting to it"""
+
+    def __call__(self, sample: Sample) -> Sample:
+        page_data = sample["page_data"]
+        assert type(page_data) is PageResponse
+
+        sample["response"] = json.dumps(
+            {
+                "primary_language": page_data.primary_language,
+                "is_rotation_valid": page_data.is_rotation_valid,
+                "rotation_correction": page_data.rotation_correction,
+                "is_table": page_data.is_table,
+                "is_diagram": page_data.is_diagram,
+                "natural_text": page_data.natural_text,
+            },
+            ensure_ascii=False,
+        )
+
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class LatexBracketNormalizer(PipelineStep):
+    """Normalizes LaTeX brackets in natural text field."""
+
+    def __call__(self, sample: Sample) -> Sample:
+        """Normalize LaTeX brackets in the natural text field."""
+        # Get the page_data object
+        if "page_data" not in sample:
+            return sample
+
+        page_data = sample["page_data"]
+        if not hasattr(page_data, "natural_text") or not page_data.natural_text:
+            return sample
+
+        text = page_data.natural_text
+
+        # Define patterns for LaTeX normalization
+        # Order matters: process display math first, then inline
+        patterns = [
+            (r"\$\$(.+?)\$\$", r"\[\1\]"),  # $$...$$ to \[...\]
+            (r"\$(.+?)\$", r"\(\1\)"),  # $...$ to \(...\)
+        ]
+
+        # Apply replacements
+        for pattern, replacement in patterns:
+            text = re.sub(pattern, replacement, text, flags=re.DOTALL)
+
+        # Update the page_data with normalized text
+        # Since PageResponse is frozen, we need to create a new instance
+        from olmocr.prompts.prompts import PageResponse
+
+        new_page_data = PageResponse(
+            primary_language=page_data.primary_language,
+            is_rotation_valid=page_data.is_rotation_valid,
+            rotation_correction=page_data.rotation_correction,
+            is_table=page_data.is_table,
+            is_diagram=page_data.is_diagram,
+            natural_text=text,
+        )
+
+        sample["page_data"] = new_page_data
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class InstructUserMessages(PipelineStep):
+    """Creates instruction-following messages format for training."""
+
+    def __call__(self, sample: Sample) -> Sample:
+        # Prepare messages
+        messages = {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": sample["image"]},
+                {"type": "text", "text": sample["instruction_prompt"]},
+            ],
+        }
+
+        sample["user_messages"] = messages
+
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class Tokenizer(PipelineStep):
+    """Tokenizes messages and creates training labels with proper masking."""
+
+    processor: Any  # The model processor (e.g., AutoProcessor)
+    masking_index: int = -100
+    end_of_message_token: str = "<|im_end|>"  # Configurable, defaults to Qwen format
+
+    def __call__(self, sample: Sample) -> Sample:
+        """Tokenize messages and create labels for training."""
+        if np is None:
+            raise ImportError("numpy is required for Tokenizer step")
+
+        # Extract user message and response
+        user_messages = sample["user_messages"]
+        response = sample["response"]
+
+        # Apply chat template to user message only with generation prompt
+        # user_messages is a single dict, so wrap it in a list
+        text = self.processor.apply_chat_template([user_messages], tokenize=False, add_generation_prompt=True)
+
+        main_image = user_messages["content"][0]["image"]
+
+        # Process inputs using processor
+        inputs = self.processor(
+            text=[text],
+            images=[main_image],
+            padding=True,
+            return_tensors="np",
+        )
+
+        # Get labels by tokenizing the output text
+        labels = self.processor(text=[response], padding=True, return_tensors="np")
+
+        # Append end-of-message token to the labels
+        end_tokens = self.processor.tokenizer(self.end_of_message_token, add_special_tokens=False)["input_ids"]
+        end_tokens = np.array(end_tokens, dtype=inputs.input_ids.dtype)
+
+        # Handle the case where labels['input_ids'] is empty
+        if labels["input_ids"].shape[1] == 0:
+            labels_input_ids_0 = np.array([], dtype=inputs.input_ids.dtype)
+        else:
+            labels_input_ids_0 = labels["input_ids"][0].astype(inputs.input_ids.dtype)
+
+        labels["input_ids"] = np.concatenate([labels_input_ids_0, end_tokens])
+        labels["input_ids"] = np.expand_dims(labels["input_ids"], axis=0)
+
+        # Concatenate input_ids and labels
+        input_ids = np.concatenate([inputs.input_ids[0], labels.input_ids[0]], axis=0)
+
+        # All columns will participate in attention fully
+        attention_mask = np.ones_like(input_ids)
+
+        # Create labels, masking the input portion with -100
+        labels_full = np.full_like(input_ids, fill_value=self.masking_index)
+        labels_full[len(inputs.input_ids[0]) :] = labels.input_ids[0]
+
+        # Return as dict, including pixel_values
+        sample["input_ids"] = input_ids
+        sample["attention_mask"] = attention_mask
+        sample["labels"] = labels_full
+        sample["pixel_values"] = inputs.pixel_values
+
+        if hasattr(inputs, "image_grid_thw"):
+            sample["image_grid_thw"] = inputs.image_grid_thw[0]
+
+        return sample
+
+
+@dataclass(frozen=True, slots=True)
+class RandomTokenFlipper(PipelineStep):
+    """Randomly flips tokens in the output (non-masked) portion and masks their labels."""
+
+    valid_token_ids: List[int]  # List of valid token IDs to substitute with
+    token_flip_rate: float = 1e-4
+    masking_index: int = -100
+
+    def __call__(self, sample: Sample) -> Sample:
+        """Randomly flip tokens in the non-masked portion of labels."""
+        if "labels" not in sample or "input_ids" not in sample:
+            return sample
+
+        # Work with copies to avoid modifying original arrays
+        labels = sample["labels"].copy()
+        input_ids = sample["input_ids"].copy()
+
+        # Find indices where labels are not masked (i.e., output tokens)
+        non_masked_indices = np.where(labels != self.masking_index)[0]
+
+        if len(non_masked_indices) == 0:
+            return sample
+
+        # For each non-masked token, independently decide whether to flip
+        for idx in non_masked_indices:
+            if np.random.random() < self.token_flip_rate:
+                # Pick a random token from the valid tokens list
+                random_token = np.random.choice(self.valid_token_ids)
+                input_ids[idx] = random_token
+                labels[idx] = self.masking_index
+
+        # Update sample with modified arrays
+        sample["input_ids"] = input_ids
+        sample["labels"] = labels
+
+        return sample
+
+
+class MarkdownPDFDocumentDataset(BaseMarkdownPDFDataset):
+    """Dataset that includes front matter parsing and PDF rendering by default."""
+
+    def __init__(self, root_dir: str | PathLike, target_longest_image_dim: int, image_transform=None, front_matter_class=None):
+        """
+        Initialize the dataset with default pipeline steps.
+
+        Args:
+            root_dir: Path to the root folder containing processed markdown and PDF files
+            target_longest_image_dim: Target dimension for the longest side of the image
+            image_transform: Optional transform to apply to the PDF images
+            front_matter_class: Optional dataclass type to validate front matter against
+        """
+        # Create default pipeline steps
+        pipeline_steps = [
+            FrontMatterParser(front_matter_class),
+            PDFRenderer(target_longest_image_dim, image_transform),
+            StaticLengthDocumentAnchoring(target_anchor_text_len=6000),
+            FinetuningPrompt(),
+            FrontMatterOutputFormat(),
+            InstructUserMessages(),
+        ]
+
+        # Initialize base class with pipeline
+        super().__init__(root_dir, pipeline_steps)
+
+
+if __name__ == "__main__":
+    import argparse
+    from pathlib import Path
+
+    # Set up logging for testing
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+    parser = argparse.ArgumentParser(description="Test MarkdownPDFDocumentDataset with YAML configuration")
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Path to YAML configuration file",
+    )
+    parser.add_argument(
+        "--dataset-type",
+        type=str,
+        choices=["train", "eval"],
+        default="train",
+        help="Which dataset subset to display (train or eval)",
+    )
+    parser.add_argument(
+        "--dataset-index",
+        type=int,
+        default=0,
+        help="Index of dataset to use from the train/eval list",
+    )
+    parser.add_argument(
+        "--sample-index",
+        type=int,
+        default=0,
+        help="Index of sample to display in detail",
     )
 
-    return dataset
+    args = parser.parse_args()
 
+    # Import config module
+    from olmocr.train.config import Config
 
-def extract_openai_batch_response(example):
-    custom_id = example.get("custom_id", None)
+    # Load configuration
+    print(f"\n=== Loading configuration from {args.config} ===")
+    config = Config.from_yaml(args.config)
 
-    # Parse the custom id into an s3 document path and page number (1indexed)
-    s3_path, page_num = parse_custom_id(custom_id)
+    # Validate configuration
+    try:
+        config.validate()
+    except ValueError as e:
+        print(f"Configuration validation failed: {e}")
+        exit(1)
 
-    response_body = example.get("response", {}).get("body", {})
-    choices = response_body.get("choices", [])
-    response = ""
-    finish_reason = ""
-    if choices:
-        first_choice = choices[0]
-        message = first_choice.get("message", {})
-        response = message.get("content", "")
-        finish_reason = first_choice.get("finish_reason", "")
+    # Load processor for tokenization
+    print(f"\nLoading processor: {config.model.name}")
+    from transformers import AutoProcessor
 
-    # TODO Maybe in the future we can parse the response (which is a structured JSON document itself)
-    # into its own columns
+    processor = AutoProcessor.from_pretrained(config.model.name)
 
-    return {"s3_path": s3_path, "page_num": page_num, "response": response, "finish_reason": finish_reason}
+    # Select dataset based on type
+    if args.dataset_type == "train":
+        dataset_configs = config.dataset.train
+        dataset_name = "train"
+    else:
+        dataset_configs = config.dataset.eval
+        dataset_name = "eval"
 
+    if args.dataset_index >= len(dataset_configs):
+        print(f"Error: Dataset index {args.dataset_index} out of range. Only {len(dataset_configs)} {dataset_name} datasets available.")
+        exit(1)
 
-def _cache_s3_file(s3_path: str, local_cache_dir: str):
-    """
-    Downloads an S3 object to a local cache directory, ensuring no two writers corrupt the same file.
-    """
-    bucket, key = parse_s3_path(s3_path)
+    dataset_cfg = dataset_configs[args.dataset_index]
+    root_dir = dataset_cfg["root_dir"]
+    pipeline_steps = config.get_pipeline_steps(dataset_cfg["pipeline"], processor)
 
-    # Define the local file path
-    local_file_path = os.path.join(local_cache_dir, bucket + "__" + key.replace("/", "_"))
-    os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-    lock_file = f"{local_file_path}.lock"
+    print(f"\n=== Testing {dataset_name} dataset {args.dataset_index} ===")
+    print(f"Root directory: {root_dir}")
+    print(f"Pipeline steps: {[step.__class__.__name__ for step in pipeline_steps]}")
 
-    # Use a file lock to prevent concurrent writes
-    with FileLock(lock_file):
-        if not os.path.exists(local_file_path):
-            logger.info(f"Downloading {s3_path} to {local_file_path}")
-            s3_client = boto3.client("s3", aws_access_key_id=os.getenv("DS_AWS_ACCESS_KEY_ID"), aws_secret_access_key=os.getenv("DS_AWS_SECRET_ACCESS_KEY"))
-            s3_client.download_file(bucket, key, local_file_path)
-        else:
-            pass
-            # logger.info(f"File {local_file_path} already exists, skipping download.")
+    # Create dataset
+    dataset = BaseMarkdownPDFDataset(root_dir, pipeline_steps)
 
-    return local_file_path
+    print(f"Dataset length: {len(dataset)}")
 
+    if len(dataset) > 0:
+        # Show first few samples
+        print("\nFirst 5 samples:")
+        for i in range(min(5, len(dataset))):
+            sample = dataset.samples[i]
+            print(f"  {i}: MD: {sample['markdown_path'].name}, PDF: {sample['pdf_path'].name}")
 
-def cache_s3_files(dataset: Dataset, pdf_cache_location: str, num_proc: int = 32) -> Dataset:
-    """
-    Caches all S3 paths in the dataset to the local cache directory.
-    """
+        # Check if sample index is valid
+        if args.sample_index >= len(dataset):
+            print(f"\nError: Sample index {args.sample_index} out of range. Only {len(dataset)} samples available.")
+            exit(1)
 
-    # Define the download function to use in parallel processing
-    def cache_file(example):
-        s3_path = example["s3_path"]
-        if s3_path:
-            # Download the file and cache it locally
-            local_path = _cache_s3_file(s3_path, pdf_cache_location)
-            return {"local_pdf_path": local_path}
-        return {"local_pdf_path": None}
+        # Get the requested sample
+        print(f"\n=== Displaying sample {args.sample_index} ===")
+        sample = dataset[args.sample_index]
 
-    # Map the caching function to the dataset (with parallelism if needed)
-    dataset = dataset.map(cache_file, num_proc=num_proc, load_from_cache_file=False)
+        # Display sample information based on pipeline output
+        print("\nSample keys:", list(sample.keys()))
 
-    return dataset
+        # If it's raw data (no tokenization)
+        if "markdown_path" in sample:
+            print(f"\nMarkdown file: {sample['markdown_path'].name}")
+        if "pdf_path" in sample:
+            print(f"PDF file: {sample['pdf_path'].name}")
+        if "image" in sample and hasattr(sample["image"], "size"):
+            print(f"Image size: {sample['image'].size}")
+        if "page_data" in sample:
+            print(f"\nPage data: {sample['page_data']}")
+        if "messages" in sample:
+            print(f"\n=== Messages ===")
+            for i, msg in enumerate(sample["messages"]):
+                print(f"\nMessage {i}:")
+                print(f"  Role: {msg['role']}")
+                print(f"  Content preview: {str(msg['content'])[:200]}...")
 
+        # If it's tokenized data
+        if "input_ids" in sample:
+            print(f"\n=== Tokenized Output ===")
+            print(f"  Keys: {list(sample.keys())}")
+            print(f"  Input IDs shape: {sample['input_ids'].shape}")
+            print(f"  Labels shape: {sample['labels'].shape}")
+            print(f"  Attention mask shape: {sample['attention_mask'].shape}")
 
-def build_finetuning_dataset(response_glob_path: str, pdf_cache_location: Optional[str] = None, num_proc: int = 32) -> Dataset:
-    if pdf_cache_location is None:
-        pdf_cache_location = os.path.join(os.path.expanduser("~"), ".cache", "olmocr_pdfs")
+            if "pixel_values" in sample:
+                print(f"  Pixel values shape: {sample['pixel_values'].shape}")
+            if "image_grid_thw" in sample:
+                print(f"  Image grid THW: {sample['image_grid_thw']}")
 
-    logger.info("Loading fine tuning dataset from OpenAI style batch responses")
-    response_data = load_jsonl_into_ds(response_glob_path)
-    response_data = response_data["train"]
+            # Show label masking
+            print(f"\nLabel masking analysis:")
+            labels = sample["labels"]
+            masked_count = np.sum(labels == -100)
+            total_count = len(labels)
+            print(f"  Total tokens: {total_count}")
+            print(f"  Masked tokens: {masked_count} ({masked_count/total_count*100:.1f}%)")
+            print(f"  Unmasked tokens: {total_count - masked_count} ({(total_count - masked_count)/total_count*100:.1f}%)")
 
-    response_data = response_data.map(extract_openai_batch_response, remove_columns=response_data.column_names, num_proc=num_proc)
+            # Find the transition point
+            transition_idx = None
+            for i in range(len(labels) - 1):
+                if labels[i] == -100 and labels[i + 1] != -100:
+                    transition_idx = i + 1
+                    break
 
-    # Don't include data where the model cut off due to a length issue, or moderation issue
-    logger.info("Filtering on finish_reason == stop")
-    final_dataset = response_data.filter(lambda x: x["finish_reason"] == "stop", num_proc=num_proc)
+            if transition_idx:
+                print(f"  Transition from masked to unmasked at position: {transition_idx}")
 
-    # Cache all the s3_paths that were accessed to a local storage location,
-    final_dataset = cache_s3_files(final_dataset, pdf_cache_location, num_proc)
+            # Print all tokens
+            input_ids = sample["input_ids"]
+            print(f"\nAll tokens ({len(input_ids)} total):")
+            print("Format: [index] Token (repr) | Label | Token ID")
+            print("-" * 80)
 
-    # Filter out pages where you cannot get an anchor text generated, to prevent errors during actual training
-    def _can_create_anchor_text(example):
-        try:
-            anchor_text = get_anchor_text(example["local_pdf_path"], example["page_num"], pdf_engine="pdfreport", target_length=4000)
-            _ = get_pdf_media_box_width_height(example["local_pdf_path"], example["page_num"])
-            return anchor_text is not None
-        except:
-            logger.exception("Could not generate anchor text for file, be sure you have all dependencies installed")
-            return False
+            for i in range(len(input_ids)):
+                token = processor.tokenizer.decode([input_ids[i]])
+                token_repr = repr(token)
+                label = labels[i] if i < len(labels) else "N/A"
+                token_id = input_ids[i]
 
-    final_dataset = final_dataset.filter(_can_create_anchor_text, num_proc=num_proc)
+                # Mark special positions
+                marker = ""
+                if transition_idx and i == transition_idx:
+                    marker = " <-- TRANSITION (first unmasked)"
+                elif i == 0:
+                    marker = " <-- START"
+                elif label != -100 and i > 0 and labels[i - 1] == -100:
+                    marker = " <-- response begins"
 
-    return final_dataset
+                print(f"[{i:4d}] {token_repr:20s} | {str(label):6s} | {token_id:6d}{marker}")
+
+            # Calculate and show token statistics after the table
+            print(f"\nToken statistics:")
+
+            # Count consecutive high-value tokens that represent the image
+            # Qwen uses tokens like 151859, 151860, etc. for image patches
+            image_token_threshold = 151000  # Typical threshold for Qwen image tokens
+            image_token_count = np.sum(input_ids > image_token_threshold)
+
+            # Calculate prompt tokens (everything masked)
+            prompt_token_count = masked_count
+
+            # Calculate output tokens (everything not masked)
+            output_token_count = total_count - masked_count
+
+            # Calculate non-image prompt tokens
+            non_image_prompt_tokens = prompt_token_count - image_token_count
+
+            print(f"  Image tokens: {image_token_count}")
+            print(f"  Prompt tokens (total): {prompt_token_count}")
+            print(f"  Prompt tokens (non-image): {non_image_prompt_tokens}")
+            print(f"  Output tokens: {output_token_count}")
+            print(f"  Total sequence length: {total_count}")
+
+        # Analyze token length distribution across entire dataset
+        if "input_ids" in sample:
+            print(f"\n\n=== Analyzing token length distribution across entire dataset ===")
+            print(f"Processing {len(dataset)} samples...")
+
+            # Function to process a single sample
+            def process_sample(idx):
+                try:
+                    current_sample = dataset[idx]
+                    if "labels" in current_sample:
+                        # Count total sequence length (all tokens, prompt + completion)
+                        labels = current_sample["labels"]
+                        total_length = len(labels)
+                        return (idx, total_length, None)
+                    return (idx, None, "No labels in sample")
+                except Exception as e:
+                    return (idx, None, str(e))
+
+            # Process samples in parallel with progress bar
+            sequence_lengths = []
+            max_sequence_length = 0
+            max_sequence_sample_idx = 0
+            errors = []
+
+            # Determine number of workers (use fewer workers to avoid memory issues)
+            import multiprocessing
+
+            num_workers = min(multiprocessing.cpu_count() // 2, 8)
+
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                # Submit all tasks
+                futures = {executor.submit(process_sample, idx): idx for idx in range(len(dataset))}
+
+                # Process results with progress bar
+                with tqdm(total=len(dataset), desc="Analyzing samples") as pbar:
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        try:
+                            idx, sequence_length, error = future.result()
+                            if error:
+                                errors.append((idx, error))
+                            elif sequence_length is not None:
+                                sequence_lengths.append(sequence_length)
+                                if sequence_length > max_sequence_length:
+                                    max_sequence_length = sequence_length
+                                    max_sequence_sample_idx = idx
+                        except Exception as e:
+                            errors.append((idx, f"Future error: {e}"))
+                        pbar.update(1)
+
+            if errors:
+                print(f"\nEncountered {len(errors)} errors during processing")
+                if len(errors) <= 5:
+                    for idx, error in errors:
+                        print(f"  Sample {idx}: {error}")
+
+            if sequence_lengths:
+                sequence_lengths = np.array(sequence_lengths)
+
+                print(f"\nTotal sequence length statistics (prompt + completion):")
+                print(f"  Total samples analyzed: {len(sequence_lengths)}")
+                print(f"  Max sequence length: {max_sequence_length} tokens (sample index: {max_sequence_sample_idx})")
+                print(f"  Min sequence length: {np.min(sequence_lengths)} tokens")
+                print(f"  Mean sequence length: {np.mean(sequence_lengths):.1f} tokens")
+                print(f"  Median sequence length: {np.median(sequence_lengths):.1f} tokens")
+                print(f"  Std dev: {np.std(sequence_lengths):.1f} tokens")
+
+                # Create histogram with 100-token buckets
+                print(f"\nSequence length histogram (100-token buckets):")
+
+                # Define buckets
+                bucket_size = 100
+                max_bucket = ((max_sequence_length // bucket_size) + 1) * bucket_size
+                buckets = list(range(0, max_bucket + bucket_size, bucket_size))
+
+                # Count samples in each bucket
+                hist, _ = np.histogram(sequence_lengths, bins=buckets)
+
+                # Find max count for scaling
+                max_count = max(hist)
+                bar_width = 50  # Width of histogram bars
+
+                print(f"\n{'Range':>15} | {'Count':>6} | Distribution")
+                print("-" * 80)
+
+                for i in range(len(hist)):
+                    start = buckets[i]
+                    end = buckets[i + 1] - 1
+                    count = hist[i]
+
+                    # Create bar
+                    if max_count > 0:
+                        bar_length = int((count / max_count) * bar_width)
+                        bar = "█" * bar_length
+                    else:
+                        bar = ""
+
+                    range_str = f"{start:>5}-{end:>5}"
+                    print(f"{range_str:>15} | {count:>6} | {bar}")
+
+    else:
+        raise AssertionError("Expected some data to be created at this point")

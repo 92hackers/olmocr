@@ -2,10 +2,7 @@ import json
 import os
 
 from anthropic import Anthropic
-from prompts import (
-    build_openai_silver_data_prompt,
-    claude_response_format_schema,
-)
+from prompts import build_openai_silver_data_prompt, claude_response_format_schema
 
 from olmocr.data.renderpdf import render_pdf_to_base64png
 from olmocr.prompts.anchor import get_anchor_text

@@ -1,9 +1,7 @@
 <div align="center">
   <!-- <img src="https://github.com/allenai/OLMo/assets/8812459/774ac485-a535-4768-8f7c-db7be20f5cc3" width="300"/> -->
 <img src="https://github.com/user-attachments/assets/d70c8644-3e64-4230-98c3-c52fddaeccb6" alt="olmOCR Logo" width="300"/>
-<br/>
-  <br>
-  <h1>olmOCR</h1>
+<hr/>
 </div>
 <p align="center">
   <a href="https://github.com/allenai/OLMo/blob/main/LICENSE">
@@ -23,17 +21,110 @@
   </a>
 </p>
 
-A toolkit for training language models to work with PDF documents in the wild.
+A toolkit for converting PDFs and other image-based document formats into clean, readable, plain text format.
 
 Try the online demo: [https://olmocr.allenai.org/](https://olmocr.allenai.org/)
 
-What is included:
- - A prompting strategy to get really good natural text parsing using ChatGPT 4o - [buildsilver.py](https://github.com/allenai/olmocr/blob/main/olmocr/data/buildsilver.py)
- - An side-by-side eval toolkit for comparing different pipeline versions - [runeval.py](https://github.com/allenai/olmocr/blob/main/olmocr/eval/runeval.py)
- - Basic filtering by language and SEO spam removal - [filter.py](https://github.com/allenai/olmocr/blob/main/olmocr/filter/filter.py)
- - Finetuning code for Qwen2-VL and Molmo-O - [train.py](https://github.com/allenai/olmocr/blob/main/olmocr/train/train.py)
- - Processing millions of PDFs through a finetuned model using Sglang - [pipeline.py](https://github.com/allenai/olmocr/blob/main/olmocr/pipeline.py)
- - Viewing [Dolma docs](https://github.com/allenai/dolma) created from PDFs - [dolmaviewer.py](https://github.com/allenai/olmocr/blob/main/olmocr/viewer/dolmaviewer.py)
+Features:
+ - Convert PDF, PNG, and JPEG based documents into clean Markdown
+ - Support for equations, tables, handwriting, and complex formatting
+ - Automatically removes headers and footers
+ - Convert into text with a natural reading order, even in the presence of
+   figures, multi-column layouts, and insets
+ - Efficient, less than $200 USD per million pages converted
+ - (Based on a 7B parameter VLM, so it requires a GPU)
+
+### News
+ - June 17, 2025 - v0.1.75 - Switch from sglang to vllm based inference pipeline, updated docker image to CUDA 12.8.
+ - May 23, 2025 - v0.1.70 - Official docker support and images are now available! [See Docker usage](#using-docker)
+ - May 19, 2025 - v0.1.68 - [olmOCR-Bench](https://github.com/allenai/olmocr/tree/main/olmocr/bench) launch, scoring 77.4. Launch includes 2 point performance boost in olmOCR pipeline due to bug fixes with prompts.
+ - Mar 17, 2025 - v0.1.60 - Performance improvements due to better temperature selection in sampling.
+ - Feb 25, 2025 - v0.1.58 -  Initial public launch and demo.
+
+### Benchmark
+
+[**olmOCR-Bench**](https://github.com/allenai/olmocr/tree/main/olmocr/bench):
+We also ship a comprehensive benchmark suite covering over 7,000 test cases across 1,400 documents to help measure performance of OCR systems. 
+
+<table>
+  <thead>
+    <tr>
+      <th align="left"><strong>Model</strong></th>
+      <th align="center">ArXiv</th>
+      <th align="center">Old Scans Math</th>
+      <th align="center">Tables</th>
+      <th align="center">Old Scans</th>
+      <th align="center">Headers and Footers</th>
+      <th align="center">Multi column</th>
+      <th align="center">Long tiny text</th>
+      <th align="center">Base</th>
+      <th align="center">Overall</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td align="left">Marker v1.7.5 (base, force_ocr)</td>
+      <td align="center">76.0</td>
+      <td align="center">57.9</td>
+      <td align="center">57.6</td>
+      <td align="center">27.8</td>
+      <td align="center">84.9</td>
+      <td align="center">72.9</td>
+      <td align="center"><strong>84.6</strong></td>
+      <td align="center">99.1</td>
+      <td align="center">70.1 ± 1.1</td>
+    </tr>
+    <tr>
+      <td align="left">MinerU v1.3.10</td>
+      <td align="center">75.4</td>
+      <td align="center">47.4</td>
+      <td align="center">60.9</td>
+      <td align="center">17.3</td>
+      <td align="center"><strong>96.6</strong></td>
+      <td align="center">59.0</td>
+      <td align="center">39.1</td>
+      <td align="center">96.6</td>
+      <td align="center">61.5 ± 1.1</td>
+    </tr>
+    <tr>
+      <td align="left">Mistral OCR API</td>
+      <td align="center">77.2</td>
+      <td align="center">67.5</td>
+      <td align="center">60.6</td>
+      <td align="center">29.3</td>
+      <td align="center">93.6</td>
+      <td align="center">71.3</td>
+      <td align="center">77.1</td>
+      <td align="center"><strong>99.4</strong></td>
+      <td align="center">72.0 ± 1.1</td>
+    </tr>
+    <tr>
+      <td align="left">olmOCR v0.1.75 (Anchored)</td>
+      <td align="center">74.9</td>
+      <td align="center">71.2</td>
+      <td align="center">71.0</td>
+      <td align="center">42.2</td>
+      <td align="center">94.5</td>
+      <td align="center">78.3</td>
+      <td align="center">73.3</td>
+      <td align="center">98.3</td>
+      <td align="center">75.5 ± 1.0</td>
+    </tr>
+    <tr>
+      <td align="left">olmOCR v0.2.0</td>
+      <td align="center"><strong>78.8</strong></td>
+      <td align="center"><strong>77.5</strong></td>
+      <td align="center">71.9</td>
+      <td align="center"><strong>45.4</strong></td>
+      <td align="center">94.2</td>
+      <td align="center"><strong>78.6</strong></td>
+      <td align="center">81.4</td>
+      <td align="center"><strong>99.8</strong></td>
+      <td align="center"><strong>78.5 ± 1.1</strong></td>
+    </tr>
+  </tbody>
+</table>
+
 
 ### Installation
 
@@ -49,58 +140,60 @@ sudo apt-get update
 sudo apt-get install poppler-utils ttf-mscorefonts-installer msttcorefonts fonts-crosextra-caladea fonts-crosextra-carlito gsfonts lcdf-typetools
 ```
 
-Set up a conda environment and install olmocr
+Set up a conda environment and install olmocr. The requirements for running olmOCR
+are difficult to install in an existing python environment, so please do make a clean python environment to install into.
 ```bash
 conda create -n olmocr python=3.11
 conda activate olmocr
 
-git clone https://github.com/allenai/olmocr.git
-cd olmocr
-
-# For CPU-only operations, ex. running benchmarks
-pip install -e .
+# For CPU-only operations, ex running the benchmark
+pip install olmocr[bench]
 
 # For actually converting the files with your own GPU
-pip install -e .[gpu] --find-links https://flashinfer.ai/whl/cu124/torch2.4/flashinfer/
+pip install olmocr[gpu]  --extra-index-url https://download.pytorch.org/whl/cu128
+
+# Recommended: Install flash infer for faster inference on GPU
+pip install https://download.pytorch.org/whl/cu128/flashinfer/flashinfer_python-0.2.5%2Bcu128torch2.7-cp38-abi3-linux_x86_64.whl
 ```
 
 ### Local Usage Example
 
 For quick testing, try the [web demo](https://olmocr.allen.ai/). To run locally, a GPU is required, as inference is powered by [sglang](https://github.com/sgl-project/sglang) under the hood.
+
 Convert a Single PDF:
 ```bash
-python -m olmocr.pipeline ./localworkspace --pdfs tests/gnarly_pdfs/horribleocr.pdf
+# Download a sample PDF
+curl -o olmocr-sample.pdf https://olmocr.allenai.org/papers/olmocr_3pg_sample.pdf
+
+# Convert it to markdown
+python -m olmocr.pipeline ./localworkspace --markdown --pdfs olmocr-sample.pdf
 ```
 
 Convert an Image file:
 ```bash
-python -m olmocr.pipeline ./localworkspace --pdfs random_page.png
+python -m olmocr.pipeline ./localworkspace --markdown --pdfs random_page.png
 ```
 
 Convert Multiple PDFs:
 ```bash
-python -m olmocr.pipeline ./localworkspace --pdfs tests/gnarly_pdfs/*.pdf
+python -m olmocr.pipeline ./localworkspace --markdown --pdfs tests/gnarly_pdfs/*.pdf
 ```
-Results will be stored as JSON in `./localworkspace`.
+
+With the addition of the `--markdown` flag, results will be stored as markdown files inside of `./localworkspace/markdown/`. 
 
 #### Viewing Results
 
-Extracted text is stored as [Dolma](https://github.com/allenai/dolma)-style JSONL inside of the `./localworkspace/results` directory.
+The `./localworkspace/` workspace folder will then have both [Dolma](https://github.com/allenai/dolma) and markdown files (if using `--markdown`).
+
 
 ```bash
-cat localworkspace/results/output_*.jsonl
+cat localworkspace/markdown/olmocr-sample.md 
 ```
 
-View results side-by-side with the original PDFs (uses `dolmaviewer` command):
-
-```bash
-python -m olmocr.viewer.dolmaviewer localworkspace/results/output_*.jsonl
 ```
-
-Now open `./dolma_previews/tests_gnarly_pdfs_horribleocr_pdf.html` in your favorite browser.
-
-![image](https://github.com/user-attachments/assets/128922d1-63e6-4d34-84f2-d7901237da1f)
-
+olmOCR: Unlocking Trillions of Tokens in PDFs with Vision Language Models
+...
+```
 
 ### Multi-node / Cluster Usage
 
@@ -128,15 +221,44 @@ For example:
 python -m olmocr.pipeline s3://my_s3_bucket/pdfworkspaces/exampleworkspace --pdfs s3://my_s3_bucket/jakep/gnarly_pdfs/*.pdf --beaker --beaker_gpus 4
 ```
 
+### Using Docker
+
+Pull the Docker image.
+```bash
+docker pull alleninstituteforai/olmocr:latest
+```
+
+To run the container interactively:
+```bash
+docker run -it --gpus all --name olmocr_container alleninstituteforai/olmocr:latest /bin/bash
+```
+
+If you want to access your local files inside the container, use volume mounting:
+```bash
+docker run -it --gpus all \
+  -v /path/to/your/local/files:/local_files \
+  --name olmocr_container \
+  alleninstituteforai/olmocr:latest /bin/bash
+```
+
+All dependencies are already installed. Once you’re inside the container, you can run olmOCR commands. For example:
+
+```bash
+curl -o olmocr-sample.pdf https://olmocr.allenai.org/papers/olmocr_3pg_sample.pdf
+
+python -m olmocr.pipeline ./localworkspace --markdown --pdfs olmocr-sample.pdf
+```
+> You can also visit our Docker repository on [Docker Hub](https://hub.docker.com/r/alleninstituteforai/olmocr).
+
 ### Full documentation for the pipeline
 
 ```bash
 python -m olmocr.pipeline --help
-usage: pipeline.py [-h] [--pdfs PDFS] [--workspace_profile WORKSPACE_PROFILE] [--pdf_profile PDF_PROFILE] [--pages_per_group PAGES_PER_GROUP]
-                   [--max_page_retries MAX_PAGE_RETRIES] [--max_page_error_rate MAX_PAGE_ERROR_RATE] [--workers WORKERS] [--apply_filter] [--stats] [--model MODEL]
-                   [--model_max_context MODEL_MAX_CONTEXT] [--model_chat_template MODEL_CHAT_TEMPLATE] [--target_longest_image_dim TARGET_LONGEST_IMAGE_DIM]
-                   [--target_anchor_text_len TARGET_ANCHOR_TEXT_LEN] [--beaker] [--beaker_workspace BEAKER_WORKSPACE] [--beaker_cluster BEAKER_CLUSTER]
-                   [--beaker_gpus BEAKER_GPUS] [--beaker_priority BEAKER_PRIORITY]
+usage: pipeline.py [-h] [--pdfs [PDFS ...]] [--workspace_profile WORKSPACE_PROFILE] [--pdf_profile PDF_PROFILE] [--pages_per_group PAGES_PER_GROUP] [--max_page_retries MAX_PAGE_RETRIES]
+                   [--max_page_error_rate MAX_PAGE_ERROR_RATE] [--workers WORKERS] [--apply_filter] [--stats] [--markdown] [--model MODEL] [--gpu-memory-utilization GPU_MEMORY_UTILIZATION]
+                   [--max_model_len MAX_MODEL_LEN] [--model_max_context MODEL_MAX_CONTEXT] [--model_chat_template MODEL_CHAT_TEMPLATE] [--target_longest_image_dim TARGET_LONGEST_IMAGE_DIM]
+                   [--target_anchor_text_len TARGET_ANCHOR_TEXT_LEN] [--beaker] [--beaker_workspace BEAKER_WORKSPACE] [--beaker_cluster BEAKER_CLUSTER] [--beaker_gpus BEAKER_GPUS]
+                   [--beaker_priority BEAKER_PRIORITY] [--port PORT] [--tensor-parallel-size TENSOR_PARALLEL_SIZE] [--data-parallel-size DATA_PARALLEL_SIZE]
                    workspace
 
 Manager for running millions of PDFs through a batch inference pipeline
@@ -160,8 +282,13 @@ options:
   --workers WORKERS     Number of workers to run at a time
   --apply_filter        Apply basic filtering to English pdfs which are not forms, and not likely seo spam
   --stats               Instead of running any job, reports some statistics about the current workspace
+  --markdown            Also write natural text to markdown files preserving the folder structure of the input pdfs
   --model MODEL         List of paths where you can find the model to convert this pdf. You can specify several different paths here, and the script will try to use the
                         one which is fastest to access
+  --gpu-memory-utilization GPU_MEMORY_UTILIZATION
+                        Fraction of VRAM vLLM may pre-allocate for KV-cache (passed through to vllm serve).
+  --max_model_len MAX_MODEL_LEN
+                        Upper bound (tokens) vLLM will allocate KV-cache for; passed through to vllm serve as --max-model-len.
   --model_max_context MODEL_MAX_CONTEXT
                         Maximum context length that the model was fine tuned under
   --model_chat_template MODEL_CHAT_TEMPLATE
@@ -180,6 +307,17 @@ options:
   --beaker_priority BEAKER_PRIORITY
                         Beaker priority level for the job
 ```
+
+## Code overview
+
+There are some nice reusable pieces of the code that may be useful for your own projects:
+ - A prompting strategy to get really good natural text parsing using ChatGPT 4o - [buildsilver.py](https://github.com/allenai/olmocr/blob/main/olmocr/data/buildsilver.py)
+ - An side-by-side eval toolkit for comparing different pipeline versions - [runeval.py](https://github.com/allenai/olmocr/blob/main/olmocr/eval/runeval.py)
+ - Basic filtering by language and SEO spam removal - [filter.py](https://github.com/allenai/olmocr/blob/main/olmocr/filter/filter.py)
+ - Finetuning code for Qwen2-VL and Molmo-O - [train.py](https://github.com/allenai/olmocr/blob/main/olmocr/train/train.py)
+ - Processing millions of PDFs through a finetuned model using Sglang - [pipeline.py](https://github.com/allenai/olmocr/blob/main/olmocr/pipeline.py)
+ - Viewing [Dolma docs](https://github.com/allenai/dolma) created from PDFs - [dolmaviewer.py](https://github.com/allenai/olmocr/blob/main/olmocr/viewer/dolmaviewer.py)
+
 
 
 ## Team

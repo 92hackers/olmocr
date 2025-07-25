@@ -33,7 +33,7 @@ class Args:
 server_check_lock = asyncio.Lock()
 
 
-async def run_olmocr_pipeline(pdf_path: str, page_num: int = 1) -> Optional[str]:
+async def run_olmocr_pipeline(pdf_path: str, page_num: int = 1, model: str = "allenai/olmOCR-7B-0225-preview") -> Optional[str]:
     """
     Process a single page of a PDF using the official olmocr pipeline's process_page function
 
@@ -52,6 +52,7 @@ async def run_olmocr_pipeline(pdf_path: str, page_num: int = 1) -> Optional[str]
         tracker = WorkerTracker()
 
     args = Args()
+    args.model = model
     semaphore = asyncio.Semaphore(1)
     worker_id = 0  # Using 0 as default worker ID
 
@@ -73,7 +74,7 @@ async def run_olmocr_pipeline(pdf_path: str, page_num: int = 1) -> Optional[str]
         page_result: PageResult = await process_page(args=args, worker_id=worker_id, pdf_orig_path=pdf_path, pdf_local_path=pdf_path, page_num=page_num)
 
         # Return the natural text from the response
-        if page_result and page_result.response:
+        if page_result and page_result.response and not page_result.is_fallback:
             return page_result.response.natural_text
         return None
 

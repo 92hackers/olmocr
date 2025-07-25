@@ -8,7 +8,7 @@ We will validate that each one of those contains at least one .md file (or repea
 corresponding to its parse for every .pdf in the /pdfs folder.
 Then, we will read each one, and check if they pass against all the rules.
 If a rule fails on some of the repeats, a short explanation is printed.
-The final score is averaged over the repeated generations.
+The final score is the average of per-JSONL file scores, where each JSONL file's score is the proportion of tests from that file that pass.
 Statistical analysis including bootstrap confidence intervals are provided for the results.
 Pairwise permutation tests are conducted between specific candidate pairs.
 """
@@ -20,15 +20,14 @@ import random
 import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from itertools import combinations
 from typing import Dict, List, Tuple
 
 from pypdf import PdfReader
 from tqdm import tqdm
 
 from .report import generate_html_report
-from .tests import BaselineTest, BasePDFTest, load_tests
-from .utils import calculate_bootstrap_ci, perform_permutation_test
+from .tests import BaselineTest, BasePDFTest, load_tests, save_tests
+from .utils import calculate_bootstrap_ci
 
 
 def evaluate_candidate(
@@ -43,6 +42,7 @@ def evaluate_candidate(
       (overall_score, total_tests, candidate_errors, test_failures, test_type_breakdown, all_test_scores, test_results)
 
       - overall_score: Average fraction of tests passed (averaged over repeats and tests).
+        Note: This is now updated at reporting time to be the average of per-JSONL file scores.
       - total_tests: Total number of tests evaluated.
       - candidate_errors: List of candidate errors (e.g. missing files).
       - test_failures: List of failure messages for tests not passing on all repeats.
@@ -59,11 +59,11 @@ def evaluate_candidate(
 
     # Map each PDF to its corresponding MD repeats (e.g., doc1_pg1_repeat1.md, doc1_pg2_repeat2.md, etc.)
     pdf_to_md_files = {}
+    all_files = list(glob.glob(os.path.join(candidate_folder, "**/*.md"), recursive=True))
+
     for pdf_name in pdf_basenames:
         md_base = os.path.splitext(pdf_name)[0]
         md_regex = re.compile(rf"^{re.escape(md_base)}_pg\d+_repeat\d+\.md$")
-        all_files = list(glob.glob(os.path.join(candidate_folder, "**/*.md"), recursive=True))
-
         md_files = [f for f in all_files if md_regex.match(os.path.relpath(f, candidate_folder))]
 
         if not md_files and not force:
@@ -185,19 +185,12 @@ def main():
         default=0.95,
         help="Confidence level for interval calculation (default: 0.95 for 95% CI).",
     )
-    parser.add_argument(
-        "--permutation_tests",
-        nargs="?",
-        const="default",
-        help=(
-            "Run permutation testing. If provided without candidate names, run default tests. "
-            "If provided with a comma-separated list of candidate names (e.g. --permutation_tests asdf,qwe,ert), "
-            "run permutation tests on all pairs of the specified candidates."
-        ),
-    )
     # New arguments
     parser.add_argument("--sample", type=int, default=None, help="Randomly sample N tests to run instead of all tests.")
     parser.add_argument("--test_report", type=str, default=None, help="Generate an HTML report of test results. Provide a filename (e.g., results.html).")
+    parser.add_argument(
+        "--output_failed", type=str, default=None, help="Output a JSONL file containing tests that failed across all candidates. Provide a filename."
+    )
     args = parser.parse_args()
 
     input_folder = args.dir if os.path.isdir(args.dir) else os.path.dirname(args.dir)
@@ -292,8 +285,43 @@ def main():
         # Always store test results for displaying jsonl file groupings
         test_results_by_candidate[candidate_name] = test_results
 
-        if all_test_scores:
-            ci = calculate_bootstrap_ci(all_test_scores, n_bootstrap=n_bootstrap, ci_level=ci_level)
+        # Group results by jsonl file for more accurate CI calculation
+        jsonl_results = {}
+        jsonl_scores = []  # List to store scores by jsonl file for CI calculation
+        jsonl_file_sizes = []  # List to store the number of tests per jsonl file
+
+        for test in all_tests:
+            # Get the jsonl file this test came from
+            jsonl_file = test_to_jsonl.get(test.id, "unknown")
+
+            if jsonl_file not in jsonl_results:
+                jsonl_results[jsonl_file] = {"total": 0, "passed": 0, "scores": []}
+
+            jsonl_results[jsonl_file]["total"] += 1
+
+            # Get the test result for this candidate if it exists
+            if not candidate_errors and hasattr(test, "pdf") and hasattr(test, "page"):
+                pdf_name = test.pdf
+                page = test.page
+                if pdf_name in test_results and page in test_results.get(pdf_name, {}):
+                    for t, passed, _ in test_results[pdf_name][page]:
+                        if t.id == test.id:
+                            # Store the test score in its jsonl group
+                            result_score = 1.0 if passed else 0.0
+                            jsonl_results[jsonl_file]["scores"].append(result_score)
+                            if passed:
+                                jsonl_results[jsonl_file]["passed"] += 1
+                            break
+
+        # Gather all the scores by jsonl file for CI calculation
+        for jsonl_file, results in jsonl_results.items():
+            if results["scores"]:
+                jsonl_file_sizes.append(len(results["scores"]))
+                jsonl_scores.extend(results["scores"])
+
+        # Calculate CI using the updated function with splits
+        if jsonl_scores:
+            ci = calculate_bootstrap_ci(jsonl_scores, n_bootstrap=n_bootstrap, ci_level=ci_level, splits=jsonl_file_sizes)
         else:
             ci = (0.0, 0.0)
         summary.append((candidate_name, overall_score, total_tests, candidate_errors, test_failures, test_type_breakdown, ci, all_test_scores))
@@ -305,26 +333,19 @@ def main():
             if test_failures:
                 for fail in test_failures:
                     print(f"  [FAIL] {fail}")
-            print(f"  Average Score: {overall_score * 100:.1f}% (95% CI: [{ci[0] * 100:.1f}%, {ci[1] * 100:.1f}%]) over {total_tests} tests.")
+            # Calculate and show the per-category average score
+            jsonl_pass_rates = []
+            for _, results in jsonl_results.items():
+                if results["total"] > 0:
+                    pass_rate = results["passed"] / results["total"]
+                    jsonl_pass_rates.append(pass_rate)
+
+            per_category_score = sum(jsonl_pass_rates) / len(jsonl_pass_rates) if jsonl_pass_rates else 0.0
+            print(f"  Average Score: {per_category_score * 100:.1f}% (95% CI: [{ci[0] * 100:.1f}%, {ci[1] * 100:.1f}%]) over {total_tests} tests.")
 
     print("\n" + "=" * 60)
     print("Final Summary with 95% Confidence Intervals:")
-    for candidate_name, overall_score, total_tests, candidate_errors, _, test_type_breakdown, ci, _ in summary:
-        if candidate_errors:
-            status = "FAILED (errors)"
-            ciw_str = ""
-        else:
-            status = f"{overall_score * 100:0.1f}%"
-            half_width = ((ci[1] - ci[0]) / 2) * 100
-            ciw_str = f"± {half_width:0.1f}%"
-        print(f"{candidate_name:20s} : Average Score: {status} {ciw_str}")
-
-        # Sort the test types alphabetically
-        for ttype in sorted(test_type_breakdown.keys()):
-            scores = test_type_breakdown[ttype]
-            avg = sum(scores) / len(scores) * 100 if scores else 0.0
-            print(f"    {ttype:8s}: {avg:0.1f}% average pass rate over {len(scores)} tests")
-
+    for idx, (candidate_name, _, total_tests, candidate_errors, _, test_type_breakdown, ci, _) in enumerate(summary):
         # Group results by jsonl file
         jsonl_results = {}
         for test in all_tests:
@@ -350,6 +371,35 @@ def main():
             if test_result:
                 jsonl_results[jsonl_file]["passed"] += 1
 
+        # Calculate new overall score as average of per-JSONL pass rates
+        jsonl_pass_rates = []
+        for jsonl_file, results in jsonl_results.items():
+            if results["total"] > 0:
+                pass_rate = results["passed"] / results["total"]
+                jsonl_pass_rates.append(pass_rate)
+
+        # New overall score is average of per-JSONL pass rates
+        new_overall_score = sum(jsonl_pass_rates) / len(jsonl_pass_rates) if jsonl_pass_rates else 0.0
+
+        # Update the overall_score in the summary list for later use (e.g., in permutation tests)
+        summary[idx] = (candidate_name, new_overall_score, total_tests, candidate_errors, summary[idx][4], test_type_breakdown, ci, summary[idx][7])
+
+        if candidate_errors:
+            status = "FAILED (errors)"
+            ciw_str = ""
+        else:
+            status = f"{new_overall_score * 100:0.1f}%"
+            # Use the CI that was calculated with proper category-based bootstrap
+            half_width = ((ci[1] - ci[0]) / 2) * 100
+            ciw_str = f"± {half_width:0.1f}%"
+        print(f"{candidate_name:20s} : Average Score: {status} {ciw_str} (average of per-JSONL scores)")
+
+        # Sort the test types alphabetically
+        for ttype in sorted(test_type_breakdown.keys()):
+            scores = test_type_breakdown[ttype]
+            avg = sum(scores) / len(scores) * 100 if scores else 0.0
+            print(f"    {ttype:8s}: {avg:0.1f}% average pass rate over {len(scores)} tests")
+
         print("\n    Results by JSONL file:")
         for jsonl_file, results in sorted(jsonl_results.items()):
             if results["total"] > 0:
@@ -357,65 +407,50 @@ def main():
                 print(f"        {jsonl_file:30s}: {pass_rate:0.1f}% ({results['passed']}/{results['total']} tests)")
         print("")
 
-    if args.permutation_tests is not None:
-        print("\n" + "=" * 60)
-        print("Pairwise Permutation Tests:")
-        valid_candidates = [c for c in summary if not c[3]]
-        if args.permutation_tests == "default":
-            olmocr_candidates = sorted([c for c in valid_candidates if "olmocr" in c[0].lower()], key=lambda x: x[1], reverse=True)
-            non_olmocr_candidates = sorted([c for c in valid_candidates if "olmocr" not in c[0].lower()], key=lambda x: x[1], reverse=True)
-            top_olmocr = olmocr_candidates[0] if olmocr_candidates else None
-            top_non_olmocr = non_olmocr_candidates[0] if non_olmocr_candidates else None
-            top_two_olmocr = olmocr_candidates[:2]
-
-            if top_olmocr and top_non_olmocr:
-                olmocr_name, olmocr_score = top_olmocr[0], top_olmocr[1]
-                non_olmocr_name, non_olmocr_score = top_non_olmocr[0], top_non_olmocr[1]
-                diff, p_value = perform_permutation_test(top_olmocr[7], top_non_olmocr[7])
-                print("\nComparison 1: Top olmocr vs Top non-olmocr candidate")
-                print(f"  {olmocr_name} ({olmocr_score*100:.1f}%) vs {non_olmocr_name} ({non_olmocr_score*100:.1f}%)")
-                print(f"  Difference: {diff*100:.2f}% (positive means {olmocr_name} is better)")
-                print(f"  p-value: {p_value:.4f}")
-                if p_value < 0.05:
-                    print("  Result: Statistically significant difference (p < 0.05)")
-                else:
-                    print("  Result: No statistically significant difference (p ≥ 0.05)")
-            else:
-                print("\nCannot perform olmocr vs non-olmocr comparison: Missing candidates")
-
-            if len(top_two_olmocr) >= 2:
-                diff, p_value = perform_permutation_test(top_two_olmocr[0][7], top_two_olmocr[1][7])
-                print("\nComparison 2: Top two olmocr candidates")
-                print(f"  {top_two_olmocr[0][0]} ({top_two_olmocr[0][1]*100:.1f}%) vs {top_two_olmocr[1][0]} ({top_two_olmocr[1][1]*100:.1f}%)")
-                print(f"  Difference: {diff*100:.2f}% (positive means {top_two_olmocr[0][0]} is better)")
-                print(f"  p-value: {p_value:.4f}")
-                if p_value < 0.05:
-                    print("  Result: Statistically significant difference (p < 0.05)")
-                else:
-                    print("  Result: No statistically significant difference (p ≥ 0.05)")
-            else:
-                print("\nCannot perform top two olmocr comparison: Not enough olmocr candidates")
-        else:
-            candidate_names = [name.strip() for name in args.permutation_tests.split(",")]
-            selected_candidates = [c for c in valid_candidates if c[0] in candidate_names]
-            if len(selected_candidates) < 2:
-                print("\nNot enough valid candidates among the selected for permutation tests.")
-            else:
-                for cand1, cand2 in combinations(selected_candidates, 2):
-                    diff, p_value = perform_permutation_test(cand1[7], cand2[7])
-                    print(f"\nComparison: {cand1[0]} vs {cand2[0]}")
-                    print(f"  {cand1[0]} ({cand1[1]*100:.1f}%) vs {cand2[0]} ({cand2[1]*100:.1f}%)")
-                    print(f"  Difference: {diff*100:.2f}% (positive means {cand1[0]} is better)")
-                    print(f"  p-value: {p_value:.4f}")
-                    if p_value < 0.05:
-                        print("  Result: Statistically significant difference (p < 0.05)")
-                    else:
-                        print("  Result: No statistically significant difference (p ≥ 0.05)")
-        print("=" * 60)
-
     # Generate HTML report if requested
     if args.test_report:
         generate_html_report(test_results_by_candidate, pdf_folder, args.test_report)
+
+    # Output tests that failed across all candidates if requested
+    if args.output_failed:
+        # Identify tests that failed across all candidates
+        all_failed_tests = []
+        valid_candidates = [c for c in summary if not c[3]]  # Skip candidates with errors
+
+        for test in all_tests:
+            # Track whether this test has any results
+            has_results = False
+            any_passed = False
+
+            for candidate_name, _, _, _, _, _, _, _ in valid_candidates:
+                # Get the test result for this candidate
+                test_result = None
+                if hasattr(test, "pdf") and hasattr(test, "page"):
+                    pdf_name = test.pdf
+                    page = test.page
+                    if pdf_name in test_results_by_candidate.get(candidate_name, {}) and page in test_results_by_candidate[candidate_name].get(pdf_name, {}):
+                        for t, passed, explanation in test_results_by_candidate[candidate_name][pdf_name][page]:
+                            if t.id == test.id:
+                                has_results = True
+                                test_result = passed
+                                if passed:
+                                    any_passed = True
+                                break
+
+            # If we have results for this test and it never passed for any candidate, add it to the failed list
+            if has_results and not any_passed:
+                # Add to the list
+                all_failed_tests.append(test)
+
+        # If we have any failed tests, write them to the specified JSONL file
+        output_path = os.path.join(input_folder, args.output_failed) if not os.path.isabs(args.output_failed) else args.output_failed
+
+        if all_failed_tests:
+            save_tests(all_failed_tests, output_path)
+
+            print(f"\nOutput {len(all_failed_tests)} tests that failed across all candidates to {output_path}")
+        else:
+            print("\nNo tests failed across all candidates. No output file created.")
 
 
 if __name__ == "__main__":

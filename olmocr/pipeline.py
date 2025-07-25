@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import atexit
 import base64
 import datetime
 import hashlib
@@ -17,7 +18,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
-from functools import cache, partial
+from functools import cache
 from io import BytesIO
 from urllib.parse import urlparse
 
@@ -30,12 +31,13 @@ from tqdm import tqdm
 
 from olmocr.check import (
     check_poppler_version,
+    check_torch_gpu_available,
 )
 from olmocr.data.renderpdf import render_pdf_to_base64png
 from olmocr.filter.filter import Language, PdfFilter
 from olmocr.image_utils import convert_image_to_pdf_bytes, is_jpeg, is_png
 from olmocr.metrics import MetricsKeeper, WorkerTracker
-from olmocr.prompts import PageResponse, build_finetuning_prompt
+from olmocr.prompts import PageResponse, build_no_anchoring_yaml_prompt
 from olmocr.prompts.anchor import get_anchor_text
 from olmocr.s3_utils import (
     download_zstd_csv,
@@ -44,6 +46,7 @@ from olmocr.s3_utils import (
     get_s3_bytes_with_backoff,
     parse_s3_path,
 )
+from olmocr.train.dataloader import FrontMatterParser
 from olmocr.version import VERSION
 from olmocr.work_queue import LocalWorkQueue, S3WorkQueue, WorkQueue
 
@@ -51,6 +54,9 @@ from olmocr.work_queue import LocalWorkQueue, S3WorkQueue, WorkQueue
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 logger.propagate = False
+
+server_logger = logging.getLogger("vllm")
+server_logger.propagate = False
 
 file_handler = logging.FileHandler("olmocr-pipeline-debug.log", mode="a")
 file_handler.setLevel(logging.DEBUG)
@@ -63,6 +69,7 @@ console_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(level
 # Add handlers to the logger
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
+server_logger.addHandler(file_handler)
 
 # Quiet logs from pypdf
 logging.getLogger("pypdf").setLevel(logging.ERROR)
@@ -83,6 +90,9 @@ get_pdf_filter = cache(lambda: PdfFilter(languages_to_keep={Language.ENGLISH, No
 
 # Specify the SGLang server URL
 SGLANG_SERVER_URL = ''
+
+# Specify a default port, but it can be overridden by args
+BASE_SERVER_PORT = 30024
 
 # Record error processing files
 ERROR_PROCESING_FILES_LOG_FILE = "olmocr_error_processing_files"
@@ -126,20 +136,12 @@ async def build_page_query(local_pdf_path: str, page: int, target_longest_image_
     Build llm request body for single page.
     convert page content into an image firstly.
     """
-    MAX_TOKENS = 3000
+    MAX_TOKENS = 4500
     assert image_rotation in [0, 90, 180, 270], "Invalid image rotation provided in build_page_query"
 
     # Allow the page rendering to process in the background while we get the anchor text (which blocks the main thread)
-    image_base64 = asyncio.to_thread(render_pdf_to_base64png, local_pdf_path, page, target_longest_image_dim=target_longest_image_dim)
+    image_base64 = await asyncio.to_thread(render_pdf_to_base64png, local_pdf_path, page, target_longest_image_dim=target_longest_image_dim)
 
-    # GET ANCHOR TEXT IS NOT THREAD SAFE!! Ahhhh..... don't try to do it
-    # and it's also CPU bound, so it needs to run in a process pool
-    loop = asyncio.get_running_loop()
-    anchor_text = loop.run_in_executor(
-        process_pool, partial(get_anchor_text, pdf_engine="pdfreport", target_length=target_anchor_text_len), local_pdf_path, page
-    )
-
-    image_base64, anchor_text = await asyncio.gather(image_base64, anchor_text)  # type: ignore
     if image_rotation != 0:
         image_bytes = base64.b64decode(image_base64)
         with Image.open(BytesIO(image_bytes)) as img:
@@ -153,14 +155,15 @@ async def build_page_query(local_pdf_path: str, page: int, target_longest_image_
         image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
     # TODO: qwen2.5-vl-7b-instruct 更加强大，上下文更长，值得升级: total: 131,072, input: 129,024, output: 8192.
+    # TODO:  qwen3.0 出世，可以升级了。
     return {
-        "model": "Qwen/Qwen2-VL-7B-Instruct",
+        "model": "olmocr",
         "messages": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": build_finetuning_prompt(anchor_text)},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_base64}"}},
+                    {"type": "text", "text": build_no_anchoring_yaml_prompt()},
                 ],
             }
         ],
@@ -241,7 +244,8 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
     """
     COMPLETION_URL = f"{SGLANG_SERVER_URL}/v1/chat/completions"
     MAX_RETRIES = args.max_page_retries
-    TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+    MODEL_MAX_CONTEXT = 16384
+    TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.5, 0.8, 0.9, 1.0]
     exponential_backoffs = 0
     local_anchor_text_len = args.target_anchor_text_len
     local_image_rotation = 0
@@ -249,10 +253,21 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
     await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "started")
 
     while attempt < MAX_RETRIES:
-        query = await build_page_query(pdf_local_path, page_num, args.target_longest_image_dim, local_anchor_text_len, image_rotation=local_image_rotation)
-        query["temperature"] = TEMPERATURE_BY_ATTEMPT[
-            min(attempt, len(TEMPERATURE_BY_ATTEMPT) - 1)
-        ]  # Change temperature as number of attempts increases to overcome repetition issues at expense of quality
+        lookup_attempt = min(attempt, len(TEMPERATURE_BY_ATTEMPT) - 1)
+        query = await build_page_query(
+            pdf_local_path,
+            page_num,
+            args.target_longest_image_dim,
+            image_rotation=local_image_rotation,
+        )
+        # Change temperature as number of attempts increases to overcome repetition issues at expense of quality
+        query["temperature"] = TEMPERATURE_BY_ATTEMPT[lookup_attempt]
+
+        # Enable guided decoding regex if needed
+        if args.guided_decoding:
+            query["guided_regex"] = (
+                r"---\nprimary_language: (?:[a-z]{2}|null)\nis_rotation_valid: (?:True|False|true|false)\nrotation_correction: (?:0|90|180|270)\nis_table: (?:True|False|true|false)\nis_diagram: (?:True|False|true|false)\n(?:---|---\n[\s\S]+)"
+            )
 
         logger.info(f"Built page query for {pdf_orig_path}-{page_num}")
         response_body = None
@@ -272,18 +287,26 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
 
             base_response_data = json.loads(response_body)
 
-            if base_response_data["usage"]["total_tokens"] > args.model_max_context:
+            if base_response_data["usage"]["total_tokens"] > MODEL_MAX_CONTEXT:
                 local_anchor_text_len = max(1, local_anchor_text_len // 2)
                 logger.info(f"Reducing anchor text len to {local_anchor_text_len} for {pdf_orig_path}-{page_num}")
-                raise ValueError("Response exceeded model_max_context, cannot use this response")
+                raise ValueError(f"Response exceeded model_max_context of {MODEL_MAX_CONTEXT}, cannot use this response")
+
+            if base_response_data["choices"][0]["finish_reason"] != "stop":
+                local_anchor_text_len = max(1, local_anchor_text_len // 2)
+                logger.info(f"Reducing anchor text len to {local_anchor_text_len} for {pdf_orig_path}-{page_num}")
+                raise ValueError("Response did not finish with reason code 'stop', cannot use this response")
 
             metrics.add_metrics(
-                sglang_input_tokens=base_response_data["usage"].get("prompt_tokens", 0),
-                sglang_output_tokens=base_response_data["usage"].get("completion_tokens", 0),
+                server_input_tokens=base_response_data["usage"].get("prompt_tokens", 0),
+                server_output_tokens=base_response_data["usage"].get("completion_tokens", 0),
             )
 
-            model_response_json = json.loads(base_response_data["choices"][0]["message"]["content"])
-            page_response = PageResponse(**model_response_json)
+            model_response_markdown = base_response_data["choices"][0]["message"]["content"]
+
+            parser = FrontMatterParser(front_matter_class=PageResponse)
+            front_matter, text = parser._extract_front_matter_and_text(model_response_markdown)
+            page_response = parser._parse_front_matter(front_matter, text)
 
             if not page_response.is_rotation_valid and attempt < MAX_RETRIES - 1:
                 logger.info(
@@ -292,6 +315,7 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
                 local_image_rotation = page_response.rotation_correction
                 raise ValueError(f"invalid_page rotation for {pdf_orig_path}-{page_num}")
 
+            metrics.add_metrics(**{"completed_pages": 1, f"finished_on_attempt_{attempt}": 1})
             await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "finished")
             # Successfully processed the page, return the result.
             return PageResult(
@@ -306,7 +330,7 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
             logger.warning(f"Client error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} {e}")
 
             # Now we want to do exponential backoff, and not count this as an actual page retry
-            # Page retrys are supposed to be for fixing bad results from the model, but actual requests to sglang
+            # Page retrys are supposed to be for fixing bad results from the model, but actual requests to vllm
             # are supposed to work. Probably this means that the server is just restarting
             sleep_delay = 10 * (2**exponential_backoffs)
             exponential_backoffs += 1
@@ -318,6 +342,10 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
             raise
         except json.JSONDecodeError as e:
             logger.warning(f"JSON decode error on attempt {attempt} for {pdf_orig_path}-{page_num}: {e}")
+
+            local_anchor_text_len = max(1, local_anchor_text_len // 2)
+            logger.info(f"Reducing anchor text len to {local_anchor_text_len} for {pdf_orig_path}-{page_num}")
+
             attempt += 1
             # Debugging, view raw response
             print(f"----------------------------------------------------------------------------")
@@ -337,6 +365,7 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
             print(f"----------------------------------------------------------------------------")
 
     logger.error(f"Failed to process {pdf_orig_path}-{page_num} after {MAX_RETRIES} attempts.")
+    metrics.add_metrics(failed_pages=1)
     await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "errored")
 
     return PageResult(
@@ -366,7 +395,7 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
         return None
 
     # Write the PDF to a temporary file, either a local file or an S3 file.
-    with tempfile.NamedTemporaryFile("wb+", suffix=".pdf") as tf:
+    with tempfile.NamedTemporaryFile("wb+", suffix=".pdf", delete=False) as tf:
         try:
             data = await asyncio.to_thread(lambda: get_s3_bytes_with_backoff(pdf_s3, pdf_orig_path))
             tf.write(data)
@@ -386,6 +415,7 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
             tf.write(convert_image_to_pdf_bytes(pdf_local_path))
             tf.flush()
 
+    try:
         try:
             # Read the PDF file from the temporary file to count the number of pages
             reader = PdfReader(pdf_local_path)
@@ -446,6 +476,9 @@ async def process_pdf(args, worker_id: int, pdf_orig_path: str):
             # You can't build a dolma doc with even 1 failed page, so just get out of here
             # However, you don't want to propagate an exception higher up and cancel the entire work_group
             return None
+    finally:
+        if os.path.exists(tf.name):
+            os.unlink(tf.name)
 
 
 def get_txt_file_path(file_path):
@@ -571,23 +604,73 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
 
             logger.info(f"Got {len(dolma_docs)} docs for {work_item.hash}")
 
-            if len(dolma_docs) > 0:
-                # Write all Dolma documents to a single local temporary file in JSONL format
-                with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tf:
-                    # Iterate over the dolma_docs and append each one to the file.
-                    for doc in dolma_docs:
-                        tf.write(json.dumps(doc))
-                        tf.write("\n")
-                    tf.flush()
+            # Write the Dolma documents to a local temporary file in JSONL format
+            with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tf:
+                for doc in dolma_docs:
+                    tf.write(json.dumps(doc))
+                    tf.write("\n")
+                tf.flush()
+                temp_path = tf.name
 
-                    # Define the output S3 path using the work_hash
-                    output_final_path = os.path.join(args.workspace, "results", f"output_{work_item.hash}.jsonl")
+            try:
+                # Define the output S3 path using the work_hash
+                output_final_path = os.path.join(args.workspace, "results", f"output_{work_item.hash}.jsonl")
 
-                    if output_final_path.startswith("s3://"):
-                        bucket, key = parse_s3_path(output_final_path)
-                        workspace_s3.upload_file(tf.name, bucket, key)
+                if output_final_path.startswith("s3://"):
+                    bucket, key = parse_s3_path(output_final_path)
+                    workspace_s3.upload_file(temp_path, bucket, key)
+                else:
+                    shutil.copyfile(temp_path, output_final_path)
+            finally:
+                # Clean up the temporary file
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+
+            # If --markdown flag is set, also write the natural text to markdown files
+            if args.markdown:
+                logger.info(f"Writing {len(dolma_docs)} markdown files for {work_item.hash}")
+                for doc in dolma_docs:
+                    source_file = doc["metadata"]["Source-File"]
+                    natural_text = doc["text"]
+
+                    # Create the output markdown path that preserves the folder structure
+                    if source_file.startswith("s3://"):
+                        # Extract the path after the bucket name for S3 sources
+                        parsed = urlparse(source_file)
+                        relative_path = parsed.path.lstrip("/")
                     else:
-                        shutil.copyfile(tf.name, output_final_path)
+                        # For local files, use the full path
+                        relative_path = source_file
+
+                    # Change the extension to .md
+                    md_filename = os.path.splitext(os.path.basename(relative_path))[0] + ".md"
+                    # Get the directory path without the filename
+                    dir_path = os.path.dirname(relative_path)
+
+                    # Create the output markdown path
+                    markdown_dir = os.path.join(args.workspace, "markdown", dir_path)
+                    markdown_path = os.path.join(markdown_dir, md_filename)
+
+                    # Create the directory structure if it doesn't exist
+                    if markdown_path.startswith("s3://"):
+                        # For S3 paths, we'll create a temporary file and upload it
+                        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as md_tf:
+                            md_tf.write(natural_text)
+                            md_tf.flush()
+                            md_temp_path = md_tf.name
+
+                        try:
+                            md_bucket, md_key = parse_s3_path(markdown_path)
+                            workspace_s3.upload_file(md_temp_path, md_bucket, md_key)
+                        finally:
+                            # Make sure to clean up the temporary file even if upload fails
+                            if os.path.exists(md_temp_path):
+                                os.unlink(md_temp_path)
+                    else:
+                        # For local paths, create the directory structure and write the file
+                        os.makedirs(markdown_dir, exist_ok=True)
+                        with open(markdown_path, "w") as md_f:
+                            md_f.write(natural_text)
 
                 # Update finished token counts from successful documents
                 metrics.add_metrics(
@@ -603,9 +686,150 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
 
 
 async def sglang_server_ready():
+    """
+    Check if the SGLang server is ready.
+    Inference server will be SGLang.
+    """
     max_attempts = 10
     delay_sec = 1
     url = f"{SGLANG_SERVER_URL}/v1/models"
+
+
+async def vllm_server_task(model_name_or_path, args, semaphore):
+    cmd = [
+        "vllm",
+        "serve",
+        model_name_or_path,
+        "--port",
+        str(BASE_SERVER_PORT),
+        "--disable-log-requests",
+        "--uvicorn-log-level",
+        "warning",
+        "--served-model-name",
+        "olmocr",
+        "--tensor-parallel-size",
+        str(args.tensor_parallel_size),
+        "--data-parallel-size",
+        str(args.data_parallel_size),
+    ]
+
+    if args.gpu_memory_utilization is not None:
+        cmd.extend(["--gpu-memory-utilization", str(args.gpu_memory_utilization)])
+
+    if args.max_model_len is not None:
+        cmd.extend(["--max-model-len", str(args.max_model_len)])
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    # Ensure the subprocess is terminated on exit
+    def _kill_proc():
+        try:
+            proc.terminate()
+        except:
+            logger.info("VLLM Process already terminated")
+
+    atexit.register(_kill_proc)
+
+    # Shared variables between tasks
+    last_running_req, last_queue_req = 0, 0
+    server_printed_ready_message = False
+    last_semaphore_release = time.time()
+
+    async def process_line(line):
+        nonlocal last_running_req, last_queue_req, last_semaphore_release, server_printed_ready_message
+        server_logger.info(line)
+
+        # if the server hasn't initialized yet, log all the lines to the main logger also, so that the user
+        # can see any warnings/errors more easily
+        if not server_printed_ready_message:
+            logger.info(line)
+
+        if "Detected errors during sampling" in line:
+            logger.error("Cannot continue, sampling errors detected, model is probably corrupt")
+            sys.exit(1)
+
+        if not server_printed_ready_message and ("The server is fired up and ready to roll!" in line or "Starting vLLM API server" in line):
+            server_printed_ready_message = True
+            last_semaphore_release = time.time()
+
+        match = re.search(r"Running: (\d+)", line)
+        if match:
+            last_running_req = int(match.group(1))
+
+        match = re.search(r"(?:Waiting|Pending):\s*(\d+)", line)
+        if match:
+            last_queue_req = int(match.group(1))
+            logger.info(f"vllm running req: {last_running_req} queue req: {last_queue_req}")
+
+    async def read_stream(stream):
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            try:
+                line = line.decode("utf-8").rstrip()
+                await process_line(line)
+            except Exception as ex:
+                logger.warning(f"Got {ex} when reading log line from inference server, skipping")
+
+    async def timeout_task():
+        nonlocal last_running_req, last_queue_req, last_semaphore_release
+        try:
+            while True:
+                await asyncio.sleep(1)
+                if server_printed_ready_message and last_queue_req == 0 and time.time() - last_semaphore_release > 30 and semaphore.locked():
+                    semaphore.release()
+                    last_semaphore_release = time.time()
+                    logger.info("Semaphore released, allowing a worker to proceed.")
+        except asyncio.CancelledError:
+            pass  # Clean up if the task is cancelled
+
+    # Start tasks to read stdout, stderr, and handle timeout logic
+    stdout_task = asyncio.create_task(read_stream(proc.stdout))
+    stderr_task = asyncio.create_task(read_stream(proc.stderr))
+    timeout_task = asyncio.create_task(timeout_task())
+
+    try:
+        await proc.wait()
+    except asyncio.CancelledError:
+        logger.info("Got cancellation request for VLLM server")
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("VLLM server did not terminate within 10 seconds")
+        raise
+
+    timeout_task.cancel()
+    await asyncio.gather(stdout_task, stderr_task, timeout_task, return_exceptions=True)
+
+
+async def vllm_server_host(model_name_or_path, args, semaphore):
+    MAX_RETRIES = 5
+    retry = 0
+
+    while retry < MAX_RETRIES:
+        await vllm_server_task(model_name_or_path, args, semaphore)
+        logger.warning("VLLM server task ended")
+        retry += 1
+
+    if retry >= MAX_RETRIES:
+        logger.error(f"Ended up starting the vllm server more than {retry} times, cancelling pipeline")
+        logger.error("")
+        logger.error(
+            "Please make sure vllm is installed according to the latest instructions here: https://docs.vllm.ai/en/stable/getting_started/installation/gpu.html"
+        )
+        sys.exit(1)
+
+
+async def vllm_server_ready():
+    max_attempts = 300
+    delay_sec = 1
+    url = f"http://localhost:{BASE_SERVER_PORT}/v1/models"
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -613,16 +837,43 @@ async def sglang_server_ready():
                 response = await session.get(url)
 
                 if response.status_code == 200:
-                    logger.info("sglang server is ready.")
+                    logger.info("vllm server is ready.")
                     return
                 else:
                     logger.info(f"Attempt {attempt}: Unexpected status code {response.status_code}")
         except Exception:
-            logger.warning(f"Attempt {attempt}: Please wait for sglang server to become ready...")
+            logger.warning(f"Attempt {attempt}: Please wait for vllm server to become ready...")
 
         await asyncio.sleep(delay_sec)
 
-    raise Exception("sglang server did not become ready after waiting.")
+    raise Exception("vllm server did not become ready after waiting.")
+
+
+async def download_model(model_name_or_path: str, max_retries: int = 5):
+    for retry in range(max_retries):
+        try:
+            if model_name_or_path.startswith("s3://") or model_name_or_path.startswith("gs://") or model_name_or_path.startswith("weka://"):
+                logger.info(f"Downloading model directory from '{model_name_or_path}'")
+                model_cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "olmocr", "model")
+                # Delete existing model cache directory if it exists
+                if os.path.exists(model_cache_dir):
+                    shutil.rmtree(model_cache_dir)
+                download_directory([model_name_or_path], model_cache_dir)
+                return model_cache_dir
+            elif os.path.isabs(model_name_or_path) and os.path.isdir(model_name_or_path):
+                logger.info(f"Using local model path at '{model_name_or_path}'")
+                return model_name_or_path
+            else:
+                logger.info(f"Downloading model with hugging face '{model_name_or_path}'")
+                snapshot_download(repo_id=model_name_or_path)
+                return model_name_or_path
+        except Exception:
+            if retry == max_retries - 1:
+                raise  # Raise on final attempt and fail the job
+
+            sleep_time = random.randrange(2, 20) * 2**retry
+            logger.exception(f"Could not download model, sleeping for {sleep_time} seconds to retry ({retry + 1}/{max_retries})")
+            await asyncio.sleep(random.randrange(10, 30) * 2**retry)
 
 
 async def metrics_reporter(work_queue):
@@ -635,7 +886,7 @@ async def metrics_reporter(work_queue):
 
 
 
-def print_stats(args):
+def print_stats(args, root_work_queue):
     LONG_CONTEXT_THRESHOLD = 32768
 
     assert args.workspace.startswith("s3://"), "Printing stats functionality only works with s3 workspaces for now."
@@ -645,7 +896,14 @@ def print_stats(args):
     output_glob = os.path.join(args.workspace, "results", "*.jsonl")
 
     done_work_items = expand_s3_glob(workspace_s3, output_glob)
-    work_queue = {parts[0]: parts[1:] for line in download_zstd_csv(workspace_s3, index_file_s3_path) if (parts := line.strip().split(",")) and line.strip()}
+    work_queue_lines = download_zstd_csv(workspace_s3, index_file_s3_path)
+
+    work_queue = {}
+    for line in work_queue_lines:
+        if line.strip():
+            parts = root_work_queue._decode_csv_row(line.strip())
+            if parts:  # Ensure we have at least one part
+                work_queue[parts[0]] = parts[1:]
 
     total_items = len(work_queue)
     completed_items = len(done_work_items)
@@ -698,6 +956,7 @@ def print_stats(args):
             logger.warning(f"Error processing {s3_path}: {e}")
             return 0, 0, 0, 0, 0, set(), 0, 0
 
+    print(f"\nCompleted work items {completed_items:,} out of {total_items:,}: {completed_items/total_items*100:.2f}%")
     print("\nProcessing output files...")
     docs_total = 0
     input_tokens_total = 0
@@ -715,7 +974,8 @@ def print_stats(args):
     for done_work_item in done_work_items:
         if match := re.search(r"output_(\w+).jsonl", done_work_item):
             done_work_hash = match.group(1)
-            original_paths.update(work_queue[done_work_hash])
+            if done_work_hash in work_queue:
+                original_paths.update(work_queue[done_work_hash])
 
     with ThreadPoolExecutor() as executor:
         futures = {executor.submit(process_output_file, item): item for item in done_work_items}
@@ -768,16 +1028,17 @@ async def main():
     parser.add_argument("--pdf_profile", help="S3 configuration profile for accessing the raw pdf documents", default=None)
     parser.add_argument("--pages_per_group", type=int, default=500, help="Aiming for this many pdf pages per work item group")
     parser.add_argument("--max_page_retries", type=int, default=8, help="Max number of times we will retry rendering a page")
-    parser.add_argument("--max_page_error_rate", type=float, default=0.5, help="Rate of allowable failed pages in a document, 1/250 by default")
-    parser.add_argument("--workers", type=int, default=8, help="Number of workers to run at a time")
+    parser.add_argument("--max_page_error_rate", type=float, default=0.001, help="Rate of allowable failed pages in a document, 1/250 by default")
+    parser.add_argument("--workers", type=int, default=20, help="Number of workers to run at a time")
     parser.add_argument("--apply_filter", action="store_true", help="Apply basic filtering to English pdfs which are not forms, and not likely seo spam")
     parser.add_argument("--stats", action="store_true", help="Instead of running any job, reports some statistics about the current workspace")
+    parser.add_argument("--markdown", action="store_true", help="Also write natural text to markdown files preserving the folder structure of the input pdfs")
 
     # Model parameters
     parser.add_argument(
         "--model",
         help="List of paths where you can find the model to convert this pdf. You can specify several different paths here, and the script will try to use the one which is fastest to access",
-        default="allenai/olmOCR-7B-0225-preview",
+        default="allenai/olmOCR-7B-0725-FP8",
     )
     parser.add_argument("--model_max_context", type=int, default="32000", help="Maximum context length that the model was fine tuned under")
     parser.add_argument("--model_chat_template", type=str, default="qwen2-vl", help="Chat template to pass to sglang server")
@@ -786,6 +1047,19 @@ async def main():
 
     parser.add_argument("--port", type=int, default=30024, help="Port to use for the SGLang server")
     parser.add_argument("--sglang_server_url", type=str, default='http://localhost:30024', help="Url to use for the SGLang server")
+
+
+    parser.add_argument("--gpu-memory-utilization", type=float, help="Fraction of VRAM vLLM may pre-allocate for KV-cache " "(passed through to vllm serve).")
+    parser.add_argument("--max_model_len", type=int, default=16384, help="Upper bound (tokens) vLLM will allocate KV-cache for, lower if VLLM won't start")
+
+    parser.add_argument("--target_longest_image_dim", type=int, help="Dimension on longest side to use for rendering the pdf pages", default=1288)
+    parser.add_argument("--target_anchor_text_len", type=int, help="Maximum amount of anchor text to use (characters), not used for new models", default=-1)
+    parser.add_argument("--guided_decoding", action="store_true", help="Enable guided decoding for model YAML type outputs")
+
+    parser.add_argument("--port", type=int, default=30024, help="Port to use for the VLLM server")
+    parser.add_argument("--tensor-parallel-size", "-tp", type=int, default=1, help="Tensor parallel size for vLLM")
+    parser.add_argument("--data-parallel-size", "-dp", type=int, default=1, help="Data parallel size for vLLM")
+
     args = parser.parse_args()
 
     args.workspace = "./local_workspace"
@@ -793,6 +1067,14 @@ async def main():
     print(f"args: {args}")
 
     start_time = time.time()
+
+    logger.info(
+        "If you run out of GPU memory during start-up or get 'KV cache is larger than available memory' errors, retry with lower values, e.g. --gpu_memory_utilization 0.80  --max_model_len 16384"
+    )
+
+    # set the global BASE_SERVER_PORT from args
+    global BASE_SERVER_PORT
+    BASE_SERVER_PORT = args.port
 
     global workspace_s3, pdf_s3
     # set the global SGLANG_SERVER_PORT from args
@@ -899,8 +1181,12 @@ async def main():
         await work_queue.populate_queue(list(pdf_work_paths), items_per_group)
 
     if args.stats:
-        print_stats(args)
+        print_stats(args, work_queue)
         return
+
+    # If you get this far, then you are doing inference and need a GPU
+    # check_sglang_version()
+    check_torch_gpu_available()
 
     logger.info(f"Starting pipeline with PID {os.getpid()}")
 
@@ -916,6 +1202,10 @@ async def main():
     # As soon as one worker is no longer saturating the gpu, the next one can start sending requests
     semaphore = asyncio.Semaphore(1)
 
+    vllm_server = asyncio.create_task(vllm_server_host(model_name_or_path, args, semaphore))
+
+    await vllm_server_ready()
+
     metrics_task = asyncio.create_task(metrics_reporter(work_queue))
 
     # Create worker tasks to process the queue concurrently.
@@ -930,9 +1220,60 @@ async def main():
     # Wait for server to stop
     process_pool.shutdown(wait=False)
 
-    global error_processing_files_counter
-
+    vllm_server.cancel()
     metrics_task.cancel()
+
+    # Wait for cancelled tasks to complete
+    await asyncio.gather(vllm_server, metrics_task, return_exceptions=True)
+
+    # Output final metrics summary
+    metrics_summary = metrics.get_metrics_summary()
+    logger.info("=" * 80)
+    logger.info("FINAL METRICS SUMMARY")
+    logger.info("=" * 80)
+    logger.info(f"Total elapsed time: {metrics_summary['elapsed_time_seconds']:.2f} seconds")
+
+    # Output token counts and rates
+    total_metrics = metrics_summary["total_metrics"]
+    rates = metrics_summary["rates"]
+
+    logger.info(f"Total Server Input tokens: {total_metrics.get('server_input_tokens', 0):,}")
+    logger.info(f"Total Server Output tokens: {total_metrics.get('server_output_tokens', 0):,}")
+
+    logger.info(f"Finished input tokens: {total_metrics.get('finished_input_tokens', 0):,}")
+    logger.info(f"Finished output tokens: {total_metrics.get('finished_output_tokens', 0):,}")
+
+    logger.info(f"Completed pages: {total_metrics.get('completed_pages', 0):,}")
+    logger.info(f"Failed pages: {total_metrics.get('failed_pages', 0):,}")
+    logger.info(
+        f"Page Failure rate: {total_metrics.get('failed_pages', 0) / max(total_metrics.get('completed_pages', 0) + total_metrics.get('failed_pages', 0), 1) * 100:.2f}%"
+    )
+
+    # Output finished_on_attempt statistics
+    logger.info("")
+    logger.info("Pages finished by attempt number:")
+    total_finished = sum(total_metrics.get(f"finished_on_attempt_{i}", 0) for i in range(args.max_page_retries))
+    cumulative = 0
+
+    for i in range(args.max_page_retries):
+        if f"finished_on_attempt_{i}" in total_metrics:
+            count = total_metrics[f"finished_on_attempt_{i}"]
+            cumulative += count
+            percentage = (count / total_finished * 100) if total_finished > 0 else 0
+            cumulative_percentage = (cumulative / total_finished * 100) if total_finished > 0 else 0
+            logger.info(f"  Attempt {i}: {count:,} pages ({percentage:.1f}%) - Cumulative: {cumulative:,} ({cumulative_percentage:.1f}%)")
+
+    # Output rates
+    if "server_input_tokens_per_sec" in rates:
+        logger.info(f"Server Input tokens/sec rate: {rates['server_input_tokens_per_sec']:.2f}")
+    if "server_output_tokens_per_sec" in rates:
+        logger.info(f"Server Output tokens/sec rate: {rates['server_output_tokens_per_sec']:.2f}")
+    if "finished_input_tokens_per_sec" in rates:
+        logger.info(f"Finished Input tokens/sec rate: {rates['finished_input_tokens_per_sec']:.2f}")
+    if "finished_output_tokens_per_sec" in rates:
+        logger.info(f"Finished Output tokens/sec rate: {rates['finished_output_tokens_per_sec']:.2f}")
+
+    logger.info("=" * 80)
     logger.info("Work done")
     end_time = time.time()
     elapsed_time = end_time - start_time

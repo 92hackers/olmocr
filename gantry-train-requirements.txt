@@ -1,0 +1,6 @@
+torchvision
+accelerate
+peft
+wandb
+omegaconf
+einops

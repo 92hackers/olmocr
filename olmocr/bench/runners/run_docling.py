@@ -1,99 +1,76 @@
-import base64
+import asyncio
 import os
-from io import BytesIO
+import tempfile
 from typing import Literal
 
-import torch
-from docling_core.types.doc import DoclingDocument
-from docling_core.types.doc.document import DocTagsDocument
-from PIL import Image
-from transformers import AutoModelForVision2Seq, AutoProcessor
-
-from olmocr.data.renderpdf import render_pdf_to_base64png
-
-_cached_model = None
-_cached_processor = None
+from pypdf import PdfReader, PdfWriter
 
 
-def init_model(model_name: str = "ds4sd/SmolDocling-256M-preview"):
-    """Initialize and cache the model and processor."""
-    global _cached_model, _cached_processor
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    if _cached_model is None:
-        processor = AutoProcessor.from_pretrained(model_name)
-        model = (
-            AutoModelForVision2Seq.from_pretrained(
-                model_name,
-                torch_dtype=torch.bfloat16,
-                # _attn_implementation="flash_attention_2" if device.type == "cuda" else "eager",
-                _attn_implementation="eager",
-            )
-            .eval()
-            .to(device)
-        )
-
-        _cached_model = model
-        _cached_processor = processor
-
-    return _cached_model, _cached_processor, device
-
-
-def run_docling(
+async def run_docling(
     pdf_path: str,
     page_num: int = 1,
-    model_name: str = "ds4sd/SmolDocling-256M-preview",
-    temperature: float = 0.1,
-    target_longest_image_dim: int = 1024,
-    output_format: Literal["markdown", "html", "doctags"] = "markdown",
+    output_format: Literal["markdown"] = "markdown",
+    use_smoldocling: bool = False,
 ) -> str:
-    # Initialize the model
-    model, processor, device = init_model(model_name)
+    """Run docling CLI on a PDF file and return the results.
 
-    # Convert PDF page to image
-    image_base64 = render_pdf_to_base64png(pdf_path, page_num=page_num, target_longest_image_dim=target_longest_image_dim)
-    image = Image.open(BytesIO(base64.b64decode(image_base64)))
+    Args:
+        pdf_path: Path to the PDF file
+        page_num: Page number to process (1-indexed)
+        output_format: Output format (only markdown is supported for CLI version)
 
-    # Create input messages
-    messages = [
-        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Convert this page to docling."}]},
-    ]
+    Returns:
+        String containing the markdown output
+    """
+    if output_format != "markdown":
+        raise ValueError("Only markdown output format is supported for CLI version")
 
-    # Prepare inputs
-    prompt = processor.apply_chat_template(messages, add_generation_prompt=True)
-    inputs = processor(text=prompt, images=[image], return_tensors="pt")
-    inputs = inputs.to(device)
+    # Extract the specific page using pypdf
+    pdf_reader = PdfReader(pdf_path)
+    pdf_writer = PdfWriter()
 
-    # Generate outputs
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **inputs,
-            max_new_tokens=8192,
-            temperature=temperature,
-            do_sample=temperature > 0,
-        )
+    # Convert from 1-indexed to 0-indexed
+    zero_based_page_num = page_num - 1
 
-    # Process the generated output
-    prompt_length = inputs.input_ids.shape[1]
-    trimmed_generated_ids = generated_ids[:, prompt_length:]
-    doctags = processor.batch_decode(
-        trimmed_generated_ids,
-        skip_special_tokens=False,
-    )[0].lstrip()
+    if zero_based_page_num >= len(pdf_reader.pages) or zero_based_page_num < 0:
+        raise ValueError(f"Page number {page_num} is out of bounds for PDF with {len(pdf_reader.pages)} pages")
 
-    # Create Docling document
-    doctags_doc = DocTagsDocument.from_doctags_and_image_pairs([doctags], [image])
-    doc = DoclingDocument(name=os.path.basename(pdf_path))
-    doc.load_from_doctags(doctags_doc)
+    # Add the selected page to the writer
+    pdf_writer.add_page(pdf_reader.pages[zero_based_page_num])
 
-    # Generate output in the requested format
-    result = None
-    if output_format == "markdown":
-        result = doc.export_to_markdown()
-    elif output_format == "html":
-        result = doc.export_to_html()
-    elif output_format == "doctags":
-        result = doctags
+    # Create temporary files for the single-page PDF and output markdown
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf_file, tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp_md_file:
+        tmp_pdf_path = tmp_pdf_file.name
+        tmp_md_path = tmp_md_file.name
 
-    return result
+    try:
+        # Write the single-page PDF to the temporary file
+        with open(tmp_pdf_path, "wb") as f:
+            pdf_writer.write(f)
+
+        # Build the command to run docling on the single-page PDF
+        if use_smoldocling:
+            cmd = ["docling", tmp_pdf_path, "-o", tmp_md_path]  # Output file
+        else:
+            cmd = ["docling", "--pipeline", "vlm", "--vlm-model", "smoldocling", tmp_pdf_path, "-o", tmp_md_path]  # Output file
+
+        # Run the command asynchronously
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            error_msg = stderr.decode() if stderr else "Unknown error"
+            raise RuntimeError(f"docling command failed with return code {proc.returncode}: {error_msg}")
+
+        # Read the results from the temporary markdown file
+        with open(tmp_md_path, "r", encoding="utf-8") as f:
+            result = f.read()
+
+        return result
+
+    finally:
+        # Clean up the temporary files
+        for path in [tmp_pdf_path, tmp_md_path]:
+            if os.path.exists(path):
+                os.unlink(path)

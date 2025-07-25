@@ -114,12 +114,17 @@ def normalize_text(md_content: str) -> str:
     if md_content is None:
         return None
 
+    # Normalize <br> and <br/> to newlines
+    md_content = re.sub(r"<br/?>", " ", md_content)
+
     # Normalize whitespace in the md_content
     md_content = re.sub(r"\s+", " ", md_content)
 
     # Remove markdown bold formatting (** or __ for bold)
     md_content = re.sub(r"\*\*(.*?)\*\*", r"\1", md_content)
     md_content = re.sub(r"__(.*?)__", r"\1", md_content)
+    md_content = re.sub(r"</?b>", "", md_content)  # Remove <b> tags if they exist
+    md_content = re.sub(r"</?i>", "", md_content)  # Remove <i> tags if they exist
 
     # Remove markdown italics formatting (* or _ for italics)
     md_content = re.sub(r"\*(.*?)\*", r"\1", md_content)

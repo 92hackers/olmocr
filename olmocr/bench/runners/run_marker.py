@@ -1,6 +1,7 @@
 import os
 import tempfile
 
+from marker.config.parser import ConfigParser
 from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict
 from marker.output import text_from_rendered
@@ -15,10 +16,22 @@ def run_marker(pdf_path: str, page_num: int = 1) -> str:
     if _marker_converter is None:
         # Create a configuration dictionary with the necessary settings
         config = {
-            "texify_inline_spans": True,  # This enables conversion of inline math to LaTeX
+            "force_ocr": True,  # This enables conversion of inline math to LaTeX
+            "use_llm": False,  # We would prefer to run just plain marker for reporting bench results, not hybrid mode
+            "disable_tqdm": True,  # Disable tqdm for cleaner output
+            "recognition_batch_size": 256,
+            "layout_batch_size": 48,
+            "detection_batch_size": 48,
+            "equation_batch_size": 64,
+            "table_rec_batch_size": 48,
+            "ocr_error_batch_size": 64,
         }
+        config_parser = ConfigParser(config)
 
-        _marker_converter = PdfConverter(artifact_dict=create_model_dict(), config=config)
+        _marker_converter = PdfConverter(
+            artifact_dict=create_model_dict(),
+            config=config_parser.generate_config_dict(),
+        )
 
     # Extract the specific page from the PDF
     pdf_to_process = pdf_path

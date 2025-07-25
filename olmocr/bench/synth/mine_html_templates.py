@@ -17,11 +17,7 @@ from playwright.async_api import async_playwright
 from syntok.segmenter import process
 from tqdm import tqdm
 
-from olmocr.bench.tests import (
-    TableTest,
-    TestType,
-    parse_html_tables,
-)
+from olmocr.bench.tests import TableTest, TestType, parse_html_tables
 from olmocr.data.renderpdf import (
     get_png_dimensions_from_base64,
     render_pdf_to_base64png,
