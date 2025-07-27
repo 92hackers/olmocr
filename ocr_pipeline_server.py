@@ -51,6 +51,7 @@ async def handle_ocr_pipeline(file: UploadFile = File(...)):
     # Run the OCR pipeline
     sys.argv = [
         "olmocr.pipeline_0725_api",
+        "./localworkspace",
         "--sglang_server_url", SGLANG_SERVER_URL,
         "--pdfs", save_path,
         "--workers", "1",
