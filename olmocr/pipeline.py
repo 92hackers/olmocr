@@ -6,7 +6,6 @@ import datetime
 import hashlib
 import json
 import logging
-import multiprocessing
 import os
 import random
 import re
@@ -14,7 +13,7 @@ import shutil
 import sys
 import tempfile
 import time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from functools import cache
@@ -84,7 +83,7 @@ metrics = MetricsKeeper(window=60 * 5)
 tracker = WorkerTracker()
 
 # Process pool for offloading cpu bound work, like calculating anchor texts, max 32 workers, otherwise it can spawn way too many workers on a big machine
-process_pool = ProcessPoolExecutor(max_workers=min(multiprocessing.cpu_count() // 2 + 1, 32), mp_context=multiprocessing.get_context("spawn"))
+# process_pool = ProcessPoolExecutor(max_workers=min(multiprocessing.cpu_count() // 2 + 1, 32), mp_context=multiprocessing.get_context("spawn"))
 
 # Filter object, cached so it will only get loaded when/if you need it
 get_pdf_filter = cache(lambda: PdfFilter(languages_to_keep={Language.ENGLISH, None}, apply_download_spam_check=True, apply_form_check=True))
@@ -287,6 +286,8 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
         except (ConnectionError, OSError, asyncio.TimeoutError) as e:
             logger.warning(f"Client error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} {e}")
 
+            print(f"raw response_body: {response_body}")
+
             # Now we want to do exponential backoff, and not count this as an actual page retry
             # Page retrys are supposed to be for fixing bad results from the model, but actual requests to vllm
             # are supposed to work. Probably this means that the server is just restarting
@@ -296,10 +297,15 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
             await asyncio.sleep(sleep_delay)
         except asyncio.CancelledError:
             logger.info(f"Process page {pdf_orig_path}-{page_num} cancelled")
+
+            print(f"raw response_body: {response_body}")
+
             await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "cancelled")
             raise
         except json.JSONDecodeError as e:
             logger.warning(f"JSON decode error on attempt {attempt} for {pdf_orig_path}-{page_num}: {e}")
+
+            print(f"raw response_body: {response_body}")
 
             local_anchor_text_len = max(1, local_anchor_text_len // 2)
             logger.info(f"Reducing anchor text len to {local_anchor_text_len} for {pdf_orig_path}-{page_num}")
@@ -307,9 +313,15 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
             attempt += 1
         except ValueError as e:
             logger.warning(f"ValueError on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
+
+            print(f"raw response_body: {response_body}")
+
             attempt += 1
         except Exception as e:
             logger.exception(f"Unexpected error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
+
+            print(f"raw response_body: {response_body}")
+
             attempt += 1
 
     logger.error(f"Failed to process {pdf_orig_path}-{page_num} after {MAX_RETRIES} attempts.")
@@ -439,6 +451,10 @@ def build_dolma_document(pdf_orig_path, page_results):
         "total-output-tokens": sum(page.output_tokens for page in page_results),
         "total-fallback-pages": sum(page.is_fallback for page in page_results),
     }
+
+    print("-----------------------------------------")
+    print(f"document_text: {document_text}")
+    print("-----------------------------------------")
 
     id_ = hashlib.sha1(document_text.encode()).hexdigest()
 
@@ -1019,9 +1035,9 @@ async def main():
     parser.add_argument("--workspace_profile", help="S3 configuration profile for accessing the workspace", default=None)
     parser.add_argument("--pdf_profile", help="S3 configuration profile for accessing the raw pdf documents", default=None)
     parser.add_argument("--pages_per_group", type=int, default=500, help="Aiming for this many pdf pages per work item group")
-    parser.add_argument("--max_page_retries", type=int, default=8, help="Max number of times we will retry rendering a page")
-    parser.add_argument("--max_page_error_rate", type=float, default=0.004, help="Rate of allowable failed pages in a document, 1/250 by default")
-    parser.add_argument("--workers", type=int, default=20, help="Number of workers to run at a time")
+    parser.add_argument("--max_page_retries", type=int, default=4, help="Max number of times we will retry rendering a page")
+    parser.add_argument("--max_page_error_rate", type=float, default=0.001, help="Rate of allowable failed pages in a document, 1/250 by default")
+    parser.add_argument("--workers", type=int, default=8, help="Number of workers to run at a time")
     parser.add_argument("--apply_filter", action="store_true", help="Apply basic filtering to English pdfs which are not forms, and not likely seo spam")
     parser.add_argument("--stats", action="store_true", help="Instead of running any job, reports some statistics about the current workspace")
     parser.add_argument("--markdown", action="store_true", help="Also write natural text to markdown files preserving the folder structure of the input pdfs")
@@ -1182,7 +1198,7 @@ async def main():
     logger.info(f"Starting pipeline with PID {os.getpid()}")
 
     # Download the model before you do anything else
-    model_name_or_path = await download_model(args.model)
+    # model_name_or_path = await download_model(args.model)
 
     # Initialize the work queue
     qsize = await work_queue.initialize_queue()
@@ -1196,7 +1212,7 @@ async def main():
     # As soon as one worker is no longer saturating the gpu, the next one can start sending requests
     semaphore = asyncio.Semaphore(1)
 
-    vllm_server = asyncio.create_task(vllm_server_host(model_name_or_path, args, semaphore))
+    # vllm_server = asyncio.create_task(vllm_server_host(model_name_or_path, args, semaphore))
 
     await vllm_server_ready()
 
@@ -1212,13 +1228,13 @@ async def main():
     await asyncio.gather(*worker_tasks)
 
     # Wait for server to stop
-    process_pool.shutdown(wait=False)
+    # process_pool.shutdown(wait=False)
 
-    vllm_server.cancel()
+    # vllm_server.cancel()
     metrics_task.cancel()
 
     # Wait for cancelled tasks to complete
-    await asyncio.gather(vllm_server, metrics_task, return_exceptions=True)
+    # await asyncio.gather(vllm_server, metrics_task, return_exceptions=True)
 
     # Output final metrics summary
     metrics_summary = metrics.get_metrics_summary()
