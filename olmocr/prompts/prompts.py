@@ -111,6 +111,8 @@ def build_no_anchoring_yaml_prompt() -> str:
     return (
         "Attached is one page of a document that you must process. "
         "Just return the plain text representation of this document as if you were reading it naturally. Convert equations to LateX and tables to markdown.\n"
+        "Please preserve the page headers and footers, if there are any. If there are references and footnotes, please preserve them also.\n"
+        "Do not hallucinate.\n"
         "Return your output as markdown, with a front matter section on top specifying values for the primary_language, is_rotation_valid, rotation_correction, is_table, and is_diagram parameters."
     )
 
