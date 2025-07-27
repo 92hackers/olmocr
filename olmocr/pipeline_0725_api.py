@@ -861,27 +861,7 @@ async def main():
     parser.add_argument("--target_longest_image_dim", type=int, help="Dimension on longest side to use for rendering the pdf pages", default=1288)
     parser.add_argument("--target_anchor_text_len", type=int, help="Maximum amount of anchor text to use (characters), not used for new models", default=-1)
     parser.add_argument("--guided_decoding", action="store_true", help="Enable guided decoding for model YAML type outputs")
-
-    vllm_group = parser.add_argument_group("VLLM Forwarded arguments")
-    vllm_group.add_argument(
-        "--gpu-memory-utilization", type=float, help="Fraction of VRAM vLLM may pre-allocate for KV-cache " "(passed through to vllm serve)."
-    )
-    vllm_group.add_argument("--max_model_len", type=int, default=16384, help="Upper bound (tokens) vLLM will allocate KV-cache for, lower if VLLM won't start")
-    vllm_group.add_argument("--tensor-parallel-size", "-tp", type=int, default=1, help="Tensor parallel size for vLLM")
-    vllm_group.add_argument("--data-parallel-size", "-dp", type=int, default=1, help="Data parallel size for vLLM")
-    vllm_group.add_argument("--port", type=int, default=30024, help="Port to use for the VLLM server")
-
-    # Beaker/job running stuff
-    beaker_group = parser.add_argument_group("beaker/cluster execution")
-    beaker_group.add_argument("--beaker", action="store_true", help="Submit this job to beaker instead of running locally")
-    beaker_group.add_argument("--beaker_workspace", help="Beaker workspace to submit to", default="ai2/olmocr")
-    beaker_group.add_argument(
-        "--beaker_cluster",
-        help="Beaker clusters you want to run on",
-        default=["ai2/jupiter-cirrascale-2", "ai2/ceres-cirrascale", "ai2/neptune-cirrascale", "ai2/saturn-cirrascale", "ai2/augusta-google-1"],
-    )
-    beaker_group.add_argument("--beaker_gpus", type=int, default=1, help="Number of gpu replicas to run")
-    beaker_group.add_argument("--beaker_priority", type=str, default="normal", help="Beaker priority level for the job")
+    parser.add_argument("--sglang_server_url", type=str, default='http://localhost:30024', help="Url to use for the SGLang server")
 
     args = parser.parse_args()
 
