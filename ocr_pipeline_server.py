@@ -7,6 +7,7 @@
 import os
 import sys
 import hashlib
+import time
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
@@ -26,6 +27,7 @@ async def handle_ocr_pipeline(file: UploadFile = File(...)):
     """
     接收单个文件并进行OCR处理，返回OCR 内容提取结果
     """
+    start_time = time.time()
     filename = os.path.basename(file.filename)
     content_type = file.content_type
     if not content_type:
@@ -67,6 +69,11 @@ async def handle_ocr_pipeline(file: UploadFile = File(...)):
     if os.path.exists(txt_save_path):
         with open(txt_save_path, "r", encoding="utf-8") as f:
             txt_content = f.read()
+
+    end_time = time.time()
+    print(f"=========================== OCR Summary ===========================")
+    print(f"----------- Running time: {end_time - start_time:.2f} seconds, for file: {filename} -----------")
+    print(f"=========================== OCR Summary ===========================")
 
     return JSONResponse({
         "filename": filename,
