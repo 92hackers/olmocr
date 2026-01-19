@@ -1,22 +1,67 @@
 # ocr_pipeline_server.py
 
-# This is a FastAPI server that receives a PDF file, saves it to a temporary file,
-# and then runs the OCR pipeline on it.
+# This is a FastAPI server that receives a PDF file,
+# and then runs the PaddleOCR API on it.
 # It returns the OCR result as a JSON object.
 
 import os
-import sys
-import hashlib
+import base64
 import time
+import logging
+import requests
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 
-from olmocr.pipeline_0725_api import main as pipeline_main
+app = FastAPI(title="PaddleOCR Pipeline Server")
 
-app = FastAPI(title="Olmocr Pipeline Server")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-SGLANG_SERVER_URL = "http://localhost:30024"
+PADDLEOCR_API_URL = os.getenv("PADDLEOCR_API_URL", "https://m1p7w4i2u1w7q4o1.aistudio-app.com/layout-parsing")
+PADDLEOCR_TOKEN = os.getenv("PADDLEOCR_TOKEN", "")
+
+FILE_TYPE_MAP = {"pdf": 0, "image": 1}
+
+
+def format_file_size(size_bytes: int) -> str:
+    """
+    Convert file size in bytes to human-readable format.
+    """
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.2f} TB"
+
+
+def log_request_info(filename: str, content_type: str, file_size: int) -> None:
+    """
+    Log incoming request file information.
+    """
+    logger.info("=" * 60)
+    logger.info("Incoming OCR Request")
+    logger.info(f"  Filename:     {filename}")
+    logger.info(f"  Content-Type: {content_type}")
+    logger.info(f"  File Size:    {file_size} bytes ({format_file_size(file_size)})")
+    logger.info("=" * 60)
+
+
+def log_ocr_summary(filename: str, duration_seconds: float, extracted_length: int) -> None:
+    """
+    Log OCR processing summary.
+    """
+    logger.info("=" * 60)
+    logger.info("OCR Processing Summary")
+    logger.info(f"  Filename:        {filename}")
+    logger.info(f"  Duration:        {duration_seconds:.2f} seconds")
+    logger.info(f"  Extracted Chars: {extracted_length}")
+    logger.info("=" * 60)
+
 
 @app.get("/health")
 def get_status():
@@ -40,46 +85,59 @@ async def handle_ocr_pipeline(file: UploadFile = File(...)):
     if not content:
         return JSONResponse({"error": "File is empty"}, status_code=400)
 
-    file_sha1 = hashlib.sha1(content).hexdigest()
-    save_path = f"/tmp/{file_sha1}_{filename}"
-    txt_save_path = f"/tmp/{file_sha1}_{filename}.txt"
-    print(f"save_path: {save_path}")
+    # Log incoming request info
+    log_request_info(filename, content_type, len(content))
 
-    # Save the file to the temporary directory if it doesn't exist
-    if not os.path.exists(save_path):
-        with open(save_path, "wb") as f:
-            f.write(content)
+    # Encode file to base64
+    file_data = base64.b64encode(content).decode("ascii")
 
-    # Run the OCR pipeline
-    sys.argv = [
-        "olmocr.pipeline_0725_api",
-        "./localworkspace",
-        "--sglang_server_url", SGLANG_SERVER_URL,
-        "--pdfs", save_path,
-        "--workers", "1",
-        "--max_page_retries", "4",
-        "--max_page_error_rate", "0.001",
-    ]
+    # Determine file type
+    file_type = FILE_TYPE_MAP["pdf"] if filename.endswith(".pdf") else FILE_TYPE_MAP["image"]
 
-    await pipeline_main()
+    # Prepare request headers and payload
+    headers = {
+        "Authorization": f"token {PADDLEOCR_TOKEN}",
+        "Content-Type": "application/json"
+    }
 
-    # Wait for the pipeline to finish
-    txt_content = ""
+    required_payload = {
+        "file": file_data,
+        "fileType": file_type,
+    }
 
-    if os.path.exists(txt_save_path):
-        with open(txt_save_path, "r", encoding="utf-8") as f:
-            txt_content = f.read()
+    optional_payload = {
+        "useDocOrientationClassify": False,
+        "useDocUnwarping": False,
+        "useChartRecognition": False,
+    }
+
+    payload = {**required_payload, **optional_payload}
+
+    # Call PaddleOCR API
+    try:
+        response = requests.post(PADDLEOCR_API_URL, json=payload, headers=headers)
+        response.raise_for_status()
+        result = response.json()["result"]
+    except requests.RequestException as e:
+        return JSONResponse({"error": f"PaddleOCR API request failed: {str(e)}"}, status_code=500)
+    except KeyError:
+        return JSONResponse({"error": "Invalid response from PaddleOCR API"}, status_code=500)
+
+    # Extract and concatenate markdown content from all parsing results
+    txt_content_parts = []
+    if result.get("layoutParsingResults"):
+        for res in result["layoutParsingResults"]:
+            markdown_text = res.get("markdown", {}).get("text", "")
+            if markdown_text:
+                txt_content_parts.append(markdown_text)
+    txt_content = "\n\n".join(txt_content_parts)
 
     end_time = time.time()
-    print(f"=========================== OCR Summary ===========================")
-    print(f"----------- Running time: {end_time - start_time:.2f} seconds, for file: {filename} -----------")
-    print(f"=========================== OCR Summary ===========================")
+    log_ocr_summary(filename, end_time - start_time, len(txt_content))
 
     return JSONResponse({
         "filename": filename,
         "content_type": content_type,
         "size": len(content),
-        "save_path": save_path,
-        "txt_save_path": txt_save_path,
         "txt_content": txt_content,
     })
